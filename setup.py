@@ -24,7 +24,7 @@ import importlib
 
 # Environment variables False/True
 PYPI_BUILD = os.environ.get("PYPI_BUILD", "False").lower() == "true"
-PACKAGE_NAME = "tilelang"
+PACKAGE_NAME = "tilelang-rocm"
 ROOT_DIR = os.path.dirname(__file__)
 
 # Add LLVM control environment variable
@@ -41,7 +41,7 @@ def load_module_from_path(module_name, path):
     return module
 
 
-envs = load_module_from_path('env', os.path.join(ROOT_DIR, PACKAGE_NAME, 'env.py'))
+envs = load_module_from_path('env', os.path.join(ROOT_DIR, "tilelang", 'env.py'))
 
 CUDA_HOME = envs.CUDA_HOME
 ROCM_HOME = envs.ROCM_HOME
@@ -112,8 +112,8 @@ def get_rocm_version():
         return LooseVersion(match.group(1))
     else:
         rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
-        rocm_version_file = os.path.join(rocm_path, "lib", "cmake", "rocm",
-                                         "rocm-config-version.cmake")
+        rocm_version_file = os.path.join(rocm_path, "lib", "cmake", "rocm-core",
+                                         "rocm-core-config-version.cmake")
         if os.path.exists(rocm_version_file):
             with open(rocm_version_file, "r") as f:
                 content = f.read()
@@ -334,7 +334,7 @@ class TileLangBuilPydCommand(build_py):
         ]
         for item in TILELANG_SRC:
             source_dir = os.path.join(ROOT_DIR, item)
-            target_dir = os.path.join(self.build_lib, PACKAGE_NAME, item)
+            target_dir = os.path.join(self.build_lib, "tilelang", item)
             if os.path.isdir(source_dir):
                 self.mkpath(target_dir)
                 distutils.dir_util.copy_tree(source_dir, target_dir)
@@ -368,8 +368,8 @@ class TileLangBuilPydCommand(build_py):
 
             if source_lib_file:
                 patch_libs(source_lib_file)
-                target_dir_release = os.path.join(self.build_lib, PACKAGE_NAME, "lib")
-                target_dir_develop = os.path.join(PACKAGE_NAME, "lib")
+                target_dir_release = os.path.join(self.build_lib, "tilelang", "lib")
+                target_dir_develop = os.path.join("tilelang", "lib")
                 os.makedirs(target_dir_release, exist_ok=True)
                 os.makedirs(target_dir_develop, exist_ok=True)
                 shutil.copy2(source_lib_file, target_dir_release)
@@ -387,7 +387,7 @@ class TileLangBuilPydCommand(build_py):
             source_dir = os.path.join(ROOT_DIR, item)
             # only copy the file
             file_name = os.path.basename(item)
-            target_dir = os.path.join(self.build_lib, PACKAGE_NAME, file_name)
+            target_dir = os.path.join(self.build_lib, "tilelang", file_name)
             target_dir = os.path.dirname(target_dir)
             if not os.path.exists(target_dir):
                 os.makedirs(target_dir)
@@ -411,7 +411,7 @@ class TileLangBuilPydCommand(build_py):
         ]
         for item in TVM_PACAKGE_ITEMS:
             source_dir = os.path.join(ROOT_DIR, item)
-            target_dir = os.path.join(self.build_lib, PACKAGE_NAME, item)
+            target_dir = os.path.join(self.build_lib, "tilelang", item)
             if os.path.isdir(source_dir):
                 self.mkpath(target_dir)
                 distutils.dir_util.copy_tree(source_dir, target_dir)
@@ -428,7 +428,7 @@ class TileLangBuilPydCommand(build_py):
         ]
         for item in CUTLASS_PREBUILD_ITEMS:
             source_dir = os.path.join(ROOT_DIR, item)
-            target_dir = os.path.join(self.build_lib, PACKAGE_NAME, item)
+            target_dir = os.path.join(self.build_lib, "tilelang", item)
             if os.path.isdir(source_dir):
                 self.mkpath(target_dir)
                 distutils.dir_util.copy_tree(source_dir, target_dir)
@@ -444,7 +444,7 @@ class TileLangBuilPydCommand(build_py):
         ]
         for item in CK_PREBUILD_ITEMS:
             source_dir = os.path.join(ROOT_DIR, item)
-            target_dir = os.path.join(self.build_lib, PACKAGE_NAME, item)
+            target_dir = os.path.join(self.build_lib, "tilelang", item)
             if os.path.isdir(source_dir):
                 self.mkpath(target_dir)
                 distutils.dir_util.copy_tree(source_dir, target_dir)
@@ -458,7 +458,7 @@ class TileLangBuilPydCommand(build_py):
         TL_CONFIG_ITEMS = ["CMakeLists.txt", "VERSION", "README.md", "LICENSE"]
         for item in TL_CONFIG_ITEMS:
             source_dir = os.path.join(ROOT_DIR, item)
-            target_dir = os.path.join(self.build_lib, PACKAGE_NAME, item)
+            target_dir = os.path.join(self.build_lib, "tilelang", item)
             if os.path.isdir(source_dir):
                 self.mkpath(target_dir)
                 distutils.dir_util.copy_tree(source_dir, target_dir)
@@ -473,7 +473,7 @@ class TileLangSdistCommand(sdist):
     """Customized setuptools sdist command - includes the pyproject.toml file."""
 
     def make_distribution(self):
-        self.distribution.metadata.name = PACKAGE_NAME
+        self.distribution.metadata.name = "tilelang"
         self.distribution.metadata.version = get_tilelang_version(
             with_cuda=False, with_system_info=False)
         super().make_distribution()
@@ -513,7 +513,7 @@ class TileLangDevelopCommand(develop):
             source_lib_file = os.path.join(ROOT_DIR, item)
             # only copy the file
             file_name = os.path.basename(item)
-            target_dir = os.path.join(PACKAGE_NAME, file_name)
+            target_dir = os.path.join("tilelang", file_name)
             target_dir = os.path.dirname(target_dir)
             target_dir = os.path.join(target_dir, "lib")
             if not os.path.exists(target_dir):
@@ -572,8 +572,8 @@ class CMakeBuild(build_ext):
         # we need to copy the lib*.so files to the tilelang/lib directory
         import glob
         files = glob.glob("*.so")
-        if os.path.exists(PACKAGE_NAME):
-            target_lib_dir = os.path.join(PACKAGE_NAME, "lib")
+        if os.path.exists("tilelang"):
+            target_lib_dir = os.path.join("tilelang", "lib")
             for file in files:
                 if not os.path.exists(target_lib_dir):
                     os.makedirs(target_lib_dir)
@@ -632,7 +632,7 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    name=PACKAGE_NAME,
+    name="tilelang-rocm",
     version=(get_tilelang_version(with_cuda=False, with_system_info=False)
              if PYPI_BUILD else get_tilelang_version()),
     packages=find_packages(where="."),
@@ -658,7 +658,7 @@ setup(
     python_requires=">=3.8",
     install_requires=get_requirements(),
     package_data=package_data,
-    include_package_data=False,
+    include_package_data=True,
     ext_modules=[CMakeExtension("TileLangCXX", sourcedir=".")],
     cmdclass={
         "build_py": TileLangBuilPydCommand,
