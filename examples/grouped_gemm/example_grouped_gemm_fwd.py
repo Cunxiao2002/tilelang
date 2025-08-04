@@ -145,7 +145,8 @@ def run_tilelang_grouped_gemm(batch_sizes_list,
                               profile=False):
     padding_M = block_M
     batch_sum = sum(batch_sizes_list)
-    kernel = grouped_gemm(tuple(batch_sizes_list), K, M, block_M, block_N, block_K, num_stages, threads)
+    kernel = grouped_gemm(
+        tuple(batch_sizes_list), K, M, block_M, block_N, block_K, num_stages, threads)
     # print(kernel.get_kernel_source())
 
     device = torch.device("cuda")

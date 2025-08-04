@@ -1,6 +1,7 @@
 # lint requirements
 -r requirements-lint.txt
 # build requirements
+Cython
 cmake>=3.26
 # runtime requirements
 cffi
@@ -27,6 +28,6 @@ setuptools
 einops
 attrs
 decorator
-flash-attn<=2.8.0
+flash-attn<=2.2.0
 scipy
 tornado

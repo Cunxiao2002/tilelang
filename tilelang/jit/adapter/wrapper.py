@@ -180,8 +180,8 @@ class TLCUDASourceWrapper(object):
         "float32": "float",
         "float16": "half_t",
         "bfloat16": "bfloat16_t",
-        "e4m3_float8": "fp8_e4_t",
-        "e5m2_float8": "fp8_e5_t",
+        "float8_e4m3": "fp8_e4_t",
+        "float8_e5m2": "fp8_e5_t",
         "float64": "double",
         "int64": "int64_t",
         "int32": "int",
@@ -373,8 +373,9 @@ class TLCUDASourceWrapper(object):
                 raise ValueError(
                     f"TMA descriptor args too short: {len(args)} elements, expected at least 3")
             _, dtype, tensor_rank, globalAddress, *remaining_args = args[1:]
+            dtype = self._pythonic_expr(dtype)
+            tensor_rank = int(self._pythonic_expr(tensor_rank))
 
-            tensor_rank = int(tensor_rank)
             # Validate tensor_rank
             if not isinstance(tensor_rank, int) or tensor_rank <= 0:
                 raise ValueError(f"Invalid tensor_rank: {tensor_rank}. Must be a positive integer")
@@ -400,6 +401,10 @@ class TLCUDASourceWrapper(object):
             try:
                 interleave, swizzle, l2Promotion, oobFill = remaining_args[4 * tensor_rank:4 *
                                                                            tensor_rank + 4]
+                interleave = self._pythonic_expr(interleave)
+                swizzle = self._pythonic_expr(swizzle)
+                l2Promotion = self._pythonic_expr(l2Promotion)
+                oobFill = self._pythonic_expr(oobFill)
             except ValueError as e:
                 raise ValueError(
                     "Failed to unpack the final 4 TMA parameters (interleave, swizzle, l2Promotion, oobFill)"
@@ -554,8 +559,8 @@ class TLNVRTCSourceWrapper(TLCUDASourceWrapper):
         "float32": "ctypes.c_float",
         "float16": "ctypes.c_uint16",
         "bfloat16": "ctypes.c_uint16",
-        "e4m3_float8": "ctypes.c_uint8",
-        "e5m2_float8": "ctypes.c_uint8",
+        "float8_e4m3": "ctypes.c_uint8",
+        "float8_e5m2": "ctypes.c_uint8",
         "float64": "ctypes.c_double",
         "int64": "ctypes.c_int64",
         "int32": "ctypes.c_int32",
@@ -761,8 +766,8 @@ class TLHIPSourceWrapper(TLCUDASourceWrapper):
         "float32": "float",
         "float16": "half_t",
         "bfloat16": "bfloat16_t",
-        "e4m3_float8": "fp8_e4_t",
-        "e5m2_float8": "fp8_e5_t",
+        "float8_e4m3": "fp8_e4_t",
+        "float8_e5m2": "fp8_e5_t",
         "float8_e4m3fnuz": "fp8_e4_t",
         "e4m3fnuz_float8": "fp8_e4_t",
         "float64": "double",

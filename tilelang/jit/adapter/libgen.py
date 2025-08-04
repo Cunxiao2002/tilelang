@@ -5,7 +5,7 @@ import os
 import os.path as osp
 import subprocess
 import tempfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from tvm.target import Target
 
@@ -36,12 +36,19 @@ class LibraryGenerator(object):
     libpath: Optional[str] = None
     lib_code: Optional[str] = None
     pass_configs: Optional[Dict[str, Any]] = None
+    compile_flags: Optional[List[str]] = None
 
-    def __init__(self, target: Target):
+    def __init__(self, target: Target, verbose: bool = False):
         self.target = target
+        self.verbose = verbose
 
     def assign_pass_configs(self, pass_configs: Optional[Dict[str, Any]] = None):
         self.pass_configs = pass_configs
+
+    def assign_compile_flags(self, compile_flags: Optional[List[str]] = None):
+        if compile_flags is None:
+            compile_flags = []
+        self.compile_flags = compile_flags
 
     def update_lib_code(self, lib_code: str):
         self.lib_code = lib_code
@@ -56,6 +63,7 @@ class LibraryGenerator(object):
 
     def compile_lib(self, timeout: float = None):
         target = self.target
+        verbose = self.verbose
         if is_cuda_target(target):
             from tilelang.env import CUTLASS_INCLUDE_DIR
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".cu", delete=False)
@@ -65,6 +73,8 @@ class LibraryGenerator(object):
             libpath = src.name.replace(".cu", ".so")
 
             disable_fast_math = self.pass_configs.get(PassConfigKey.TL_DISABLE_FAST_MATH, False)
+            ptxas_usage_level = self.pass_configs.get(PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL,
+                                                      None)
             verbose_ptxas_output = self.pass_configs.get(
                 PassConfigKey.TL_ENABLE_PTXAS_VERBOSE_OUTPUT, False)
 
@@ -75,7 +85,7 @@ class LibraryGenerator(object):
                 "-Xcudafe",
                 "--diag_suppress=177",
                 "--compiler-options",
-                "'-fPIC'",
+                "-fPIC",
                 "-lineinfo",
                 "--shared",
                 src.name,
@@ -85,8 +95,10 @@ class LibraryGenerator(object):
             ]
             if not disable_fast_math:
                 command += ["--use_fast_math"]
+            if ptxas_usage_level is not None:
+                command += [f"--ptxas-options=--register-usage-level={ptxas_usage_level}"]
             if verbose_ptxas_output:
-                command += ["--ptxas-options", "-v"]
+                command += ["--ptxas-options=--verbose"]
             command += [
                 "-I" + CUTLASS_INCLUDE_DIR,
             ]
@@ -123,12 +135,20 @@ class LibraryGenerator(object):
         command += [
             "-I" + TILELANG_TEMPLATE_PATH,
         ]
+
+        if self.compile_flags:
+            command += [
+                item for flag in self.compile_flags for item in flag.split() if item not in command
+            ]
+
         command += ["-o", libpath]
 
         src.write(self.lib_code)
         src.flush()
 
         try:
+            if verbose:
+                print(f"compile_lib compilation command: {' '.join(command)}")
             ret = subprocess.run(command, timeout=timeout)
         except Exception as e:
             raise RuntimeError(f"Compile kernel failed because of {e}") from e
@@ -197,6 +217,7 @@ class PyLibraryGenerator(LibraryGenerator):
 
     def compile_lib(self, timeout: float = None):
         target = self.target
+        verbose = self.verbose
         if is_cuda_target(target):
             from tilelang.env import (CUDA_HOME, CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH)
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".cu", delete=False)
@@ -215,11 +236,15 @@ class PyLibraryGenerator(LibraryGenerator):
 
             cuda_home = "/usr/local/cuda" if CUDA_HOME is None else CUDA_HOME
 
+            options = [f"-I{tl_template_path}", f"-I{cutlass_path}", f"-I{cuda_home}/include"]
+            if self.compile_flags:
+                options += [
+                    item for flag in self.compile_flags for item in flag.split()
+                    if item not in options
+                ]
+
             cubin_bytes = compile_cuda(
-                self.lib_code,
-                target_format="cubin",
-                options=[f"-I{tl_template_path}", f"-I{cutlass_path}", f"-I{cuda_home}/include"],
-                verbose=True)
+                self.lib_code, target_format="cubin", options=options, verbose=verbose)
             with open(libpath, "wb") as f:
                 f.write(cubin_bytes)
 

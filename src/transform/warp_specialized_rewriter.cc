@@ -5,6 +5,7 @@
 
 #include "arith/ir_visitor_with_analyzer.h"
 #include "tir/analysis/var_use_def_analysis.h"
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
@@ -22,24 +23,45 @@ using arith::IRVisitorWithAnalyzer;
 
 enum class Role { kConsumer, kProducer, kBoth };
 
-class TMAFinder : public StmtExprVisitor {
+class ProducerBufferDetector : public StmtExprVisitor {
 public:
-  void clear() { has_tma_load_ = false; }
+  ProducerBufferDetector(
+      std::unordered_set<const BufferNode *> cur_producer_buffers)
+      : cur_producer_buffers_(cur_producer_buffers) {}
+
+  void clear() { has_producer_buffer_ = false; }
 
   void VisitExpr_(const CallNode *call) final {
     if (call->op.same_as(tma_load()) || call->op.same_as(tma_load_im2col())) {
-      has_tma_load_ = true;
+      has_producer_buffer_ = true;
     }
+    StmtExprVisitor::VisitExpr_(call);
   }
 
-  bool has_tma_load_ = false;
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (cur_producer_buffers_.count(op->buffer.get())) {
+      has_producer_buffer_ = true;
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  bool has_producer_buffer_ = false;
+  std::unordered_set<const BufferNode *> cur_producer_buffers_;
 };
 
 class ProducerUsedBufferFinder : public StmtExprVisitor {
 public:
   auto FindProducerusedBuffer(Stmt stmt) {
-    VisitStmt(stmt);
-    return used_in_producer_cond_;
+    producer_buffers_.clear();
+    std::unordered_set<const BufferNode *> last_producer_buffers_;
+    for (;;) {
+      VisitStmt(stmt);
+      if (producer_buffers_ == last_producer_buffers_) {
+        break;
+      }
+      last_producer_buffers_ = producer_buffers_;
+    }
+    return producer_buffers_;
   }
 
   void InsertBuffer(const PrimExpr &expr) {
@@ -47,36 +69,51 @@ public:
     VarUseDefAnalyzer usage(Array<Var>{});
     usage(expr);
     for (const auto &buffer : usage.buffer_use_count_) {
-      used_in_producer_cond_.insert(buffer.first);
-    }
-    for (const auto &buffer : used_in_producer_cond_) {
+      producer_buffers_.insert(buffer.first);
     }
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
-    TMAFinder tma_finder;
-    tma_finder(op->then_case);
+    ProducerBufferDetector producer_buffer_detector(producer_buffers_);
+    producer_buffer_detector(op->then_case);
     if (op->else_case.defined()) {
-      tma_finder(op->else_case.value());
+      producer_buffer_detector(op->else_case.value());
     }
-    if (tma_finder.has_tma_load_) {
+    if (producer_buffer_detector.has_producer_buffer_) {
       InsertBuffer(op->condition);
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const ForNode *op) final {
-    TMAFinder tma_finder;
-    tma_finder(op->body);
-    if (tma_finder.has_tma_load_) {
+    ProducerBufferDetector producer_buffer_detector(producer_buffers_);
+    producer_buffer_detector(op->body);
+    if (producer_buffer_detector.has_producer_buffer_) {
       InsertBuffer(op->min);
       InsertBuffer(op->extent);
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (producer_buffers_.count(op->buffer.get())) {
+      InsertBuffer(op->value);
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(tma_load()) || op->op.same_as(tma_load_im2col())) {
+      for (auto arg : op->args) {
+        if (auto buffer_load = arg.as<BufferLoadNode>()) {
+          producer_buffers_.insert(buffer_load->buffer.get());
+        }
+      }
+    }
+  }
+
 private:
-  std::unordered_set<const BufferNode *> used_in_producer_cond_;
+  std::unordered_set<const BufferNode *> producer_buffers_;
 };
 
 class WarpSpecializedRoleMarker : public StmtVisitor {
@@ -86,7 +123,7 @@ public:
 
   void Prepare(const Stmt &stmt) {
     ProducerUsedBufferFinder finder;
-    used_in_producer_cond_ = finder.FindProducerusedBuffer(stmt);
+    producer_buffers_ = finder.FindProducerusedBuffer(stmt);
   }
 
   Role GetRole(const StmtNode *stmt) const {
@@ -114,7 +151,7 @@ public:
   void VisitStmt_(const BufferStoreNode *op) final {
     bool is_shared_store =
         op->buffer.scope() == "shared.dyn" || op->buffer.scope() == "shared";
-    if (used_in_producer_cond_.count(op->buffer.get())) {
+    if (producer_buffers_.count(op->buffer.get())) {
       SetRole(op, Role::kBoth);
       return;
     }
@@ -198,7 +235,7 @@ private:
   std::unordered_map<const StmtNode *, Role> map_;
   bool has_simt_copy_ = false;
   bool has_bulk_copy_ = false;
-  std::unordered_set<const BufferNode *> used_in_producer_cond_;
+  std::unordered_set<const BufferNode *> producer_buffers_;
 };
 
 static PrimExpr makeGetBarrier(PrimExpr barrier_id) {
@@ -447,7 +484,7 @@ private:
       order_anno.push_back(Integer(op_info.order));
       stage_anno.push_back(Integer(op_info.stage));
     }
-    Map<String, ObjectRef> for_annotations = op->annotations;
+    Map<String, Any> for_annotations = op->annotations;
     for_annotations.erase("tl_pipeline_group");
     for_annotations.Set("software_pipeline_order", order_anno);
     for_annotations.Set("software_pipeline_stage", stage_anno);
@@ -636,9 +673,9 @@ private:
   Stmt VisitStmt_(const ForNode *op) final {
     int num_stages = 1;
     auto num_stages_anno = op->annotations.Get("num_stages");
-    if (num_stages_anno.defined()) {
-      ICHECK(num_stages_anno.as<IntImmNode>());
-      num_stages = static_cast<int>(num_stages_anno.as<IntImmNode>()->value);
+    if (num_stages_anno) {
+      ICHECK(num_stages_anno->as<IntImmNode>());
+      num_stages = static_cast<int>(num_stages_anno->as<IntImmNode>()->value);
       ICHECK(num_stages_ == 1) << "Nested pipeline not supported.";
     }
     loop_stack_.emplace_back(op->loop_var, op->extent);
@@ -648,16 +685,16 @@ private:
     Array<Integer> stage_info_array;
 
     auto group_anno = op->annotations.Get("tl_pipeline_group");
-    if (group_anno.defined()) {
-      group_info_array = Downcast<Array<Array<Integer>>>(group_anno);
+    if (group_anno) {
+      group_info_array = Downcast<Array<Array<Integer>>>(group_anno.value());
     }
     auto order_anno = op->annotations.Get("tl_pipeline_order");
-    if (order_anno.defined()) {
-      order_info_array = Downcast<Array<Integer>>(order_anno);
+    if (order_anno) {
+      order_info_array = Downcast<Array<Integer>>(order_anno.value());
     }
     auto stage_anno = op->annotations.Get("tl_pipeline_stage");
-    if (stage_anno.defined()) {
-      stage_info_array = Downcast<Array<Integer>>(stage_anno);
+    if (stage_anno) {
+      stage_info_array = Downcast<Array<Integer>>(stage_anno.value());
     }
 
     PipelineInfo pipeline_info(group_info_array, order_info_array,
@@ -686,8 +723,8 @@ private:
     auto result = FilterByRole(op);
 
     Stmt grouped_for_node;
-    if (result.as<ForNode>() && group_anno.defined() &&
-        group_info_array.size() > 0 && !is_emitting_producer_) {
+    if (result.as<ForNode>() && group_anno && group_info_array.size() > 0 &&
+        !is_emitting_producer_) {
       GroupOpRewriter group_op_rewriter(pipeline_info_);
       auto for_node = Downcast<For>(result);
       grouped_for_node = group_op_rewriter(for_node);
@@ -707,7 +744,7 @@ private:
         for_node.CopyOnWrite()->annotations.erase("tl_pipeline_order");
         for_node.CopyOnWrite()->annotations.erase("tl_pipeline_stage");
       }
-      if (is_emitting_producer_ || !group_anno.defined() ||
+      if (is_emitting_producer_ || !group_anno ||
           group_info_array.size() == 0) {
         loop_stack_.pop_back();
         return for_node;
@@ -769,10 +806,22 @@ private:
                   /*body*/ seq_stmt[i]);
       auto access = GetBlockAccessRegion(block, buffer_data_to_buffer_);
       std::set<const BufferNode *> read_set, write_set;
-      for (auto region : access[0])
-        read_set.insert(region->buffer.get());
-      for (auto region : access[1])
-        write_set.insert(region->buffer.get());
+      for (auto region : access[0]) {
+        auto var = region->buffer->data;
+        if (buffer_data_to_buffer_.count(var)) {
+          read_set.insert(buffer_data_to_buffer_[var].get());
+        } else {
+          read_set.insert(region->buffer.get());
+        }
+      }
+      for (auto region : access[1]) {
+        auto var = region->buffer->data;
+        if (buffer_data_to_buffer_.count(var)) {
+          write_set.insert(buffer_data_to_buffer_[var].get());
+        } else {
+          write_set.insert(region->buffer.get());
+        }
+      }
       reads.push_back(std::move(read_set));
       writes.push_back(std::move(write_set));
     }
@@ -1091,7 +1140,7 @@ private:
 
     auto inc_reg_stmt = Evaluate(0);
     auto dec_reg_stmt = Evaluate(0);
-    if (dec_reg >= 0 && inc_reg >= 0) {
+    if (dec_reg >= 0 && inc_reg >= 0 && !marker.HasSimtCopy()) {
       inc_reg_stmt = Evaluate(Call(DataType::Handle(), set_max_nreg(),
                                    {inc_reg == 0 ? 240 : inc_reg, 1}));
       dec_reg_stmt = Evaluate(Call(DataType::Handle(), set_max_nreg(),
@@ -1218,8 +1267,10 @@ tvm::transform::Pass WarpSpecialized() {
   return CreatePrimFuncPass(pass_func, 0, "tl.WarpSpecialized", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.WarpSpecialized")
-    .set_body_typed(WarpSpecialized);
+TVM_FFI_STATIC_INIT_BLOCK({
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.WarpSpecialized", WarpSpecialized);
+});
 
 } // namespace tl
 } // namespace tvm

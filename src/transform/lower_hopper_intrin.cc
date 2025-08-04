@@ -3,6 +3,7 @@
  * \brief Lower Hopper intrinsics cuda GPU(sm90+)
  */
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/stmt_functor.h>
@@ -72,8 +73,9 @@ public:
           auto stmts = prefetch_calls_;
           stmts.insert(stmts.end(), init_mbarrier_calls_.begin(),
                        init_mbarrier_calls_.end());
-          auto init_stmt = IfThenElse(
-              EQ(iv->var, 0), stmts.size() > 1 ? SeqStmt(stmts) : stmts[0]);
+          auto init_stmt =
+              IfThenElse(EQ(iv->var, IntImm(iv->var->dtype, 0)),
+                         stmts.size() > 1 ? SeqStmt(stmts) : stmts[0]);
           stmt_seq.push_back(init_stmt);
           if (!init_mbarrier_calls_.empty()) {
             Stmt mem_sync =
@@ -148,8 +150,10 @@ tvm::transform::Pass LowerHopperIntrin() {
   return CreatePrimFuncPass(pass_func, 0, "tl.LowerHopperIntrin", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.LowerHopperIntrin")
-    .set_body_typed(LowerHopperIntrin);
+TVM_FFI_STATIC_INIT_BLOCK({
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.LowerHopperIntrin", LowerHopperIntrin);
+});
 #endif // (CUDA_MAJOR_VERSION >= 12)
 
 } // namespace tl

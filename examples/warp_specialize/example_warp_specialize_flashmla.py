@@ -9,6 +9,7 @@ import argparse
 tilelang.disable_cache()
 
 
+@tilelang.jit(out_idx=[6])
 def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_H, num_split):
     scale = (1.0 / (dim + pe_dim))**0.5 * 1.44269504  # log2(e)
     dtype = "float16"
@@ -49,8 +50,10 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
             scores_max_0 = T.alloc_fragment([block_H], accum_dtype)
             scores_max_1 = T.alloc_fragment([block_H], accum_dtype)
             scores_max = T.alloc_shared([block_H], accum_dtype)
+
             scores_max_prev_0 = T.alloc_fragment([block_H], accum_dtype)
             scores_max_prev_1 = T.alloc_fragment([block_H], accum_dtype)
+
             scores_scale_0 = T.alloc_shared([block_H], accum_dtype)
             scores_scale_1 = T.alloc_shared([block_H], accum_dtype)
             scores_sum_0 = T.alloc_fragment([block_H], accum_dtype)
@@ -77,7 +80,6 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
             p0_1_1_ready_barrier = T.alloc_barrier(arrive_count=128)
             lse_0_ready_barrier = T.alloc_barrier(arrive_count=128)
             lse_1_ready_barrier = T.alloc_barrier(arrive_count=128)
-            s_shared_ready_barrier = T.alloc_barrier(arrive_count=128)
             q_shared_ready_barrier = T.alloc_barrier(arrive_count=256)
             k_pe_shared_1_free_barrier = T.alloc_barrier(arrive_count=128)
             k_pe_shared_0_free_barrier = T.alloc_barrier(arrive_count=128)
@@ -391,16 +393,7 @@ def ref_program(q, q_pe, kv, k_pe, glse, Output_partial):
     return out
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--batch', type=int, default=132, help='batch size')
-    parser.add_argument('--heads', type=int, default=128, help='q heads number')
-    parser.add_argument('--kv_heads', type=int, default=1, help='kv heads number')
-    parser.add_argument('--kv_ctx', type=int, default=8192, help='kv context length')
-    parser.add_argument('--dim', type=int, default=512, help='head dim')
-    parser.add_argument('--pe_dim', type=int, default=64, help='pe head dim')
-    args = parser.parse_args()
-    batch, heads, kv_heads, kv_ctx, dim, pe_dim = args.batch, args.heads, args.kv_heads, args.kv_ctx, args.dim, args.pe_dim
+def main(batch=1, heads=128, kv_heads=1, kv_ctx=8192, dim=512, pe_dim=64):
     qk_flops = 2 * batch * heads * kv_ctx * (dim + pe_dim)
     pv_flops = 2 * batch * heads * kv_ctx * dim
     total_flops = qk_flops + pv_flops
@@ -408,8 +401,7 @@ def main():
     BLOCK_H = 64
     num_split = 1
 
-    program = flashattn(batch, heads, kv_heads, kv_ctx, dim, pe_dim, BLOCK_N, BLOCK_H, num_split)
-    kernel = tilelang.compile(program, out_idx=[6])
+    kernel = flashattn(batch, heads, kv_heads, kv_ctx, dim, pe_dim, BLOCK_N, BLOCK_H, num_split)
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Randn)
     profiler.assert_allclose(ref_program, rtol=0.01, atol=0.01)
     latency = profiler.do_bench(warmup=500)
@@ -418,4 +410,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch', type=int, default=1, help='batch size')
+    parser.add_argument('--heads', type=int, default=128, help='q heads number')
+    parser.add_argument('--kv_heads', type=int, default=1, help='kv heads number')
+    parser.add_argument('--kv_ctx', type=int, default=8192, help='kv context length')
+    parser.add_argument('--dim', type=int, default=512, help='head dim')
+    parser.add_argument('--pe_dim', type=int, default=64, help='pe head dim')
+    args = parser.parse_args()
+    batch, heads, kv_heads, kv_ctx, dim, pe_dim = args.batch, args.heads, args.kv_heads, args.kv_ctx, args.dim, args.pe_dim
+    main(batch, heads, kv_heads, kv_ctx, dim, pe_dim)
