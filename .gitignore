@@ -92,3 +92,7 @@ tilelang/jit/adapter/cython/.cycache
 
 # cache directory for clangd
 .cache/
+
+*.pt
+
+*.ncu-rep*

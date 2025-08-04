@@ -3,8 +3,15 @@ import argparse
 import tilelang
 import tilelang.language as T
 import math
+import itertools
+from tilelang.autotuner import *
+from qtc import qtc_group_gemm
+
 
 tilelang.disable_cache()
+
+def to_int8(tensor: torch.Tensor) -> torch.Tensor:
+    return torch.round(tensor.clamp(min=-128, max=127)).to(dtype=torch.int8)
 
 
 def torch_gmm(a, b, batch_sizes, batch_offsets_tensor, trans_b=False):
@@ -24,21 +31,31 @@ def torch_gmm(a, b, batch_sizes, batch_offsets_tensor, trans_b=False):
         batch_sizes), "The first dimension of b must match the length of batch_sizes"
 
     # Initialize output tensor
-    output = torch.empty((sum(batch_sizes), b.shape[2]), device=a.device, dtype=a.dtype)
+    output = torch.empty((sum(batch_sizes), b.shape[1]), device=a.device, dtype=torch.bfloat16)
 
     # Perform grouped GEMM
     start = 0
     for i, size in enumerate(batch_sizes):
         end = start + size
-        part_a = a[start:end]
-        part_b = b[i].transpose(0, 1) if trans_b else b[i]
+        part_a = a[start:end].to(torch.bfloat16)
+        part_b = b[i].transpose(0, 1).to(torch.bfloat16) if trans_b else b[i].to(torch.bfloat16)
         part_out = torch.mm(part_a, part_b)
         output[start:end] = part_out
         start = end
 
     return output
 
+def get_configs():
+    iter_params = dict(
+        block_M=[64, 128, 256],
+        block_N=[64, 128, 256],
+        block_K=[32, 64, 128],
+        num_stages=[0, 1, 2],
+        threads=[128, 256],
+    )
+    return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
 
+# @autotune(configs=get_configs(), warmup=10, rep=10)
 @tilelang.jit(
     out_idx=[2], pass_configs={
         "tl.disable_tma_lower": False,
@@ -52,7 +69,7 @@ def grouped_gemm(batch_sizes_list,
                  block_K,
                  num_stages=2,
                  threads=128,
-                 dtype="float16"):
+                 dtype="int8"):
     """
     args:
         a (torch.Tensor): Input tensor of shape (M, K).
@@ -60,12 +77,13 @@ def grouped_gemm(batch_sizes_list,
     """
     batch_sum = sum(batch_sizes_list)
     batch_count = len(batch_sizes_list)
-    accum_dtype = "float32"
+    accum_dtype = "int32"
 
     @T.prim_func
     def kernel(
             A: T.Tensor([batch_sum, K], dtype),  # type: ignore
-            B: T.Tensor([batch_count, K, N], dtype),  # type: ignore
+            # B: T.Tensor([batch_count, K, N], dtype),  # type: ignore
+            B: T.Tensor([batch_count, N, K], dtype),  # type: ignore
             C: T.Tensor([batch_sum, N], dtype),  # type: ignore
             batch_sizes: T.Tensor([batch_count], "int32"),  # type: ignore
             batch_offsets: T.Tensor([batch_count], "int32"),  # type: ignore
@@ -76,7 +94,8 @@ def grouped_gemm(batch_sizes_list,
                 T.ceildiv(batch_sum, block_M) + batch_count, T.ceildiv(N, block_N),
                 threads=threads) as (bx, by):
             A_shared = T.alloc_shared([block_M, block_K], dtype)
-            B_shared = T.alloc_shared([block_K, block_N], dtype)
+            # B_shared = T.alloc_shared([block_K, block_N], dtype)
+            B_shared = T.alloc_shared([block_N, block_K], dtype)
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             cur_batch_idx = T.alloc_local([1], "int32")
             cur_batch_size = T.alloc_local([1], "int32")
@@ -98,10 +117,12 @@ def grouped_gemm(batch_sizes_list,
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(A[m_start:m_start + block_M, k * block_K:(k + 1) * block_K], A_shared)
-                T.copy(
-                    B[cur_batch_idx[0], k * block_K:(k + 1) * block_K,
-                      by * block_N:(by + 1) * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_local)
+                # T.copy(
+                #     B[cur_batch_idx[0], k * block_K:(k + 1) * block_K,
+                #       by * block_N:(by + 1) * block_N], B_shared)
+                T.copy(B[cur_batch_idx[0], by * block_N:(by + 1) * block_N,
+                      k * block_K:(k + 1) * block_K], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
 
             for i, j in T.Parallel(block_M, block_N):
                 with T.If(i < actual_rows), T.Then():
@@ -111,6 +132,7 @@ def grouped_gemm(batch_sizes_list,
 
 
 def construct_inputs(batch_sizes_list, K, M, trans_b, padding_M, device, dtype):
+    torch.manual_seed(42)
     batch_sum = sum(batch_sizes_list)
     batch_count = len(batch_sizes_list)
     batch_offsets_list = [0]
@@ -121,8 +143,9 @@ def construct_inputs(batch_sizes_list, K, M, trans_b, padding_M, device, dtype):
         batch_padded_offsets_list.append(batch_padded_offsets_list[-1] +
                                          math.ceil((batch_sizes_list[i] + 1) / padding_M) *
                                          padding_M)
-    A = torch.randn(batch_sum, K, device=device, dtype=dtype)
-    B = torch.randn(batch_count, K, M, device=device, dtype=dtype)
+    A = to_int8(torch.randn(batch_sum, K, device=device, dtype=torch.float16))
+    # B = torch.randn(batch_count, K, M, device=device, dtype=dtype)
+    B = to_int8(torch.randn(batch_count, M, K, device=device, dtype=torch.float16))
     C = torch.empty(batch_sum, M, device=device, dtype=dtype)
     batch_sizes = torch.tensor(batch_sizes_list, device=device, dtype=torch.int32)
     batch_offsets = torch.tensor(batch_offsets_list, device=device, dtype=torch.int32)
@@ -146,28 +169,62 @@ def run_tilelang_grouped_gemm(batch_sizes_list,
     padding_M = block_M
     batch_sum = sum(batch_sizes_list)
     kernel = grouped_gemm(tuple(batch_sizes_list), K, M, block_M, block_N, block_K, num_stages, threads)
+    # kernel = grouped_gemm(tuple(batch_sizes_list), K, M)
     # print(kernel.get_kernel_source())
 
     device = torch.device("cuda")
-    dtype = torch.float16
+    # dtype = torch.float16
+    dtype = torch.int8
 
     A, B, C, batch_sizes, batch_offsets, batch_padded_offsets = construct_inputs(
         batch_sizes_list, K, M, trans_b, padding_M, device, dtype)
-    out = kernel(A, B, batch_sizes, batch_offsets, batch_padded_offsets)
-    ref_output = torch_gmm(A, B, batch_sizes, batch_offsets, trans_b)
-    # print(out)
-    # print(ref_output)
-    if torch.allclose(out, ref_output, rtol=0.01, atol=0.01):
+
+    # print(A[64, 0:10])
+    cuda_out = qtc_group_gemm(A, B, batch_sizes, batch_offsets, batch_padded_offsets)
+    # cuda_out = torch.empty_like(C)
+    # tl_out = kernel(A, B, batch_sizes, batch_offsets, batch_padded_offsets)
+    ref_output = torch_gmm(A, B, batch_sizes, batch_offsets, trans_b=True)
+    print("---------cuda kernel output---------")
+    print(cuda_out)
+    # print("---------tilelang output---------")
+    # print(tl_out)
+    print("---------torch output---------")
+    print(ref_output)
+    if torch.allclose(cuda_out, ref_output, rtol=0.01, atol=0.01):
         print("✅ Tilelang and Torch match")
     else:
         print("❌ Tilelang and Torch mismatch")
+        # mismatch_mask = ~torch.isclose(tl_out, ref_output, rtol=0.01, atol=0.01)
+        # mismatch_indices = torch.nonzero(mismatch_mask)
+        
+        # # 打印前100个不匹配点（避免输出过多）
+        # max_print = 10
+        # print(f"\nFirst {min(len(mismatch_indices), max_print)} mismatches:")
+        # print("Row\tCol\tTilelang\tTorch\tDiff")
+        
+        # for idx in mismatch_indices[:max_print]:
+        #     row, col = idx.tolist()
+        #     tilelang_val = tl_out[row, col].item()
+        #     torch_val = ref_output[row, col].item()
+        #     diff = tilelang_val - torch_val
+        #     print(f"{row}\t{col}\t{tilelang_val:.2f}\t\t{torch_val:.2f}\t{diff:.2f}")
+        
+        # # 统计信息
+        # all_diffs = (tl_out - ref_output)[mismatch_mask]
+        # print("\nStatistics:")
+        # print(f"Total mismatches: {len(mismatch_indices)}")
+        # print(f"Max diff: {all_diffs.max().item():.2f}")
+        # print(f"Min diff: {all_diffs.min().item():.2f}")
+        # print(f"Avg diff: {all_diffs.float().mean().item():.2f}")
 
-    if profile:
-        profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
-        latency = profiler.do_bench(
-            warmup=500, input_tensors=[A, B, batch_sizes, batch_offsets, batch_padded_offsets])
-        print(f"Latency: {latency} ms")
-        print(f"TFlops: {batch_sum * K * M * 2 / latency * 1e-9} TFlops")
+    # if profile:
+    #     # profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
+    #     # latency = profiler.do_bench(
+    #     #     warmup=500, input_tensors=[A, B, batch_sizes, batch_offsets, batch_padded_offsets])
+    #     latency = kernel.latency
+    #     print(f"Best config: {kernel.config}")
+    #     print(f"Latency: {latency} ms")
+    #     print(f"TFlops: {batch_sum * K * M * 2 / latency * 1e-9} TFlops")
 
 
 def test_grouped_gemm():
@@ -195,16 +252,25 @@ if __name__ == "__main__":
     block_N = 128
     block_K = 64
     num_stages = 2
+    trans_b = True
     threads = 256
 
-    run_tilelang_grouped_gemm(
-        batch_sizes_list,
-        K,
-        M,
-        block_M,
-        block_N,
-        block_K,
-        trans_b,
-        num_stages,
-        threads,
-        profile=args.profile)
+    # run_tilelang_grouped_gemm(
+    #     batch_sizes_list,
+    #     K,
+    #     M,
+    #     block_M,
+    #     block_N,
+    #     block_K,
+    #     trans_b,
+    #     num_stages,
+    #     threads,
+    #     profile=args.profile)
+
+    # only tp, tp=8
+    # run_tilelang_grouped_gemm([192]*16*8, 4096, 320, 64, 64, 64, trans_b=False, profile=args.profile)
+    # run_tilelang_grouped_gemm([192]*16*8, 160, 4096, 64, 64, 64, trans_b=False, profile=args.profile)
+
+    # only ep=8
+    run_tilelang_grouped_gemm([192]*16, 4096, 2560, 64, 128, 256, num_stages=2, threads=256, trans_b=False, profile=args.profile)
+    # run_tilelang_grouped_gemm([192]*16, 1280, 4096, 64, 64, 64, trans_b=False, profile=args.profile)
