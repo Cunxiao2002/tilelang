@@ -60,7 +60,7 @@ def get_configs():
         "tl.disable_tma_lower": False,
         "tl.disable_warp_specialized": False
     })
-def grouped_gemm(batch_sizes_list,
+def grouped_gemm_persistent(batch_sizes_list,
                  K,
                  N,
                  block_M,
@@ -68,7 +68,9 @@ def grouped_gemm(batch_sizes_list,
                  block_K,
                  num_stages=2,
                  threads=128,
-                 dtype="int8"):
+                 dtype="int8",
+                 accum_dtype="int32",
+                 use_persistent_primitive=True):
     """
     args:
         a (torch.Tensor): Input tensor of shape (M, K).
@@ -77,6 +79,25 @@ def grouped_gemm(batch_sizes_list,
     batch_sum = sum(batch_sizes_list)
     batch_count = len(batch_sizes_list)
     accum_dtype = "int32"
+
+    sm_num = driver.get_num_sms()
+    m_blocks = T.ceildiv(M, block_M)
+    n_blocks = T.ceildiv(N, block_N)
+    waves = T.ceildiv(m_blocks * n_blocks, sm_num)
+    group_size = 8
+
+    @T.prim_func
+    def main_persistent_primitive(
+        A: T.Tensor([batch_sum, K], dtype),  # type: ignore
+        B: T.Tensor([batch_count, N, K], dtype),  # type: ignore
+        C: T.Tensor([batch_sum, N], "bfloat16"),  # type: ignore
+        batch_sizes: T.Tensor([batch_count], "int32"),  # type: ignore
+        batch_offsets: T.Tensor([batch_count], "int32"),  # type: ignore
+        batch_padded_offsets: T.Tensor([batch_count], "int32"),  # type: ignore
+    ):
+        with T.Kernel()
+
+
 
     @T.prim_func
     def kernel(
