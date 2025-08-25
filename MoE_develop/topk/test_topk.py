@@ -46,6 +46,7 @@ def Topk_val(
                 for i, j in T.Parallel(block_M, num_experts):
                     logits_frag[i, j] = T.if_then_else(max_val[i] == logits_frag[i, j], 0, logits_frag[i, j])
                 
+
                 
                 # T.print(max_idx)
                 T.copy(max_val, topk_gates[bx * block_M, k])
@@ -62,7 +63,7 @@ def ref_program(logits, top_k):
 def main():
     num_tokens = 320
     num_expert = 128
-    top_k = 2
+    top_k = 6
     block_M = 64
     block_N = 64
     block_K = 64
@@ -98,7 +99,7 @@ extern "C" __global__ void __launch_bounds__(128, 1) kernel_kernel(float* __rest
   // for (int i_1 = 0; i_1 < 16; ++i_1) {
   //   max_idx[i_1] = 1;
   // }
-  for (int k = 0; k < 2; ++k) {
+  for (int k = 0; k < 6; ++k) {
     for (int i_1 = 0; i_1 < 16; ++i_1) {
       max_idx[i_1] = -1;
     }
@@ -140,13 +141,13 @@ extern "C" __global__ void __launch_bounds__(128, 1) kernel_kernel(float* __rest
     #pragma unroll
     for (int i_5 = 0; i_5 < 16; ++i_5) {
       // if (((i_5 * 2) + (((((int)threadIdx.x) >> 5) + k) >> 1)) < 1) {
-        topk_gates[((((((int)blockIdx.x) * 128) + (i_5 * 4) * 2) + (((int)threadIdx.x) >> 5) * 2) + k)] = max_val[i_5];
+        topk_gates[((((((int)blockIdx.x) * 384) + (i_5 * 4) * 6) + (((int)threadIdx.x) >> 5) * 6) + k)] = max_val[i_5];
       // }
     }
     #pragma unroll
     for (int i_6 = 0; i_6 < 16; ++i_6) {
       // if (((i_6 * 2) + (((((int)threadIdx.x) >> 5) + k) >> 1)) < 1) {
-        topk_indices[((((((int)blockIdx.x) * 128) + (i_6 * 4) * 2) + (((int)threadIdx.x) >> 5) * 2) + k)] = max_idx[i_6];
+        topk_indices[((((((int)blockIdx.x) * 384) + (i_6 * 4) * 6) + (((int)threadIdx.x) >> 5) * 6) + k)] = max_idx[i_6];
       // }
     }
   }
