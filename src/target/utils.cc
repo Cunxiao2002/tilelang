@@ -50,7 +50,14 @@ bool TargetIsHopper(Target target) {
   if (!TargetIsCuda(target))
     return false;
   int arch = GetArchInt(target);
-  return arch >= 90;
+  return arch >= 90 && arch < 100;
+}
+
+bool TargetIsSM120(Target target) {
+  if (!TargetIsCuda(target))
+    return false;
+  int arch = GetArchInt(target);
+  return arch >= 120 && arch < 130;
 }
 
 bool TargetIsCDNA(Target target) {
@@ -91,6 +98,13 @@ bool TargetHasLdmatrix(Target target) {
 }
 
 bool TargetHasStmatrix(Target target) {
+  if (!TargetIsCuda(target))
+    return false;
+  int arch = GetArchInt(target);
+  return arch >= 90;
+}
+
+bool TargetHasBulkCopy(Target target) {
   if (!TargetIsCuda(target))
     return false;
   int arch = GetArchInt(target);

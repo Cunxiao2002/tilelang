@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "../op/builtin.h"
-#include "../op/bulk_copy.h"
 #include "arith/pattern_match.h"
 #include "target/source/ptx.h"
 
@@ -695,7 +694,7 @@ void CodeGenTileLangCUDA::PrintStorageScope(const std::string &scope,
   ICHECK_NE(scope, "global")
       << "Cannot allocate global memory when targeting CUDA. You must pass "
          "all global arrays as input instead";
-  if (scope == "shared") {
+  if (scope == "shared" || scope == "shared.barrier") {
     os << "__shared__ ";
   } else if (scope == "shared.dyn") {
     os << "extern __shared__ __align__(1024) ";
@@ -943,6 +942,19 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << ss.str();
     this->stream << ");\n";
   };
+  auto print_mbarrier_obj = [&](PrimExpr barrier_id) {
+    std::ostringstream ss;
+    if (barrier_id.as<IntImmNode>()) {
+      // incase the barrier_id is an integer, we need to print the barrier_id as
+      // an integer
+      ss << mbarrier_name_ << "[" << barrier_id << "]";
+    } else {
+      // otherwise may be a T.get_mbarrier() call or BufferLoad Node
+      // we need to print the barrier_id as a string
+      ss << this->PrintExpr(barrier_id);
+    }
+    return ss.str();
+  };
   if (op->op.same_as(builtin::ptx_cp_async())) {
     std::string dst = this->PrintExpr(op->args[0]);
     std::string dst_offset = this->PrintExpr(op->args[1]);
@@ -971,27 +983,73 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::create_barriers())) {
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;
-    std::string barrier_name = "_mbarrier";
-    this->stream << "__shared__ uint64_t " << barrier_name << "["
+    auto mbarrier_storage_name = mbarrier_name_ + "_mem";
+    this->stream << "__shared__ uint64_t " << mbarrier_storage_name << "["
                  << barrier_count << "];\n";
+    this->PrintIndent();
+    this->stream << "auto " << mbarrier_name_ << " = reinterpret_cast<"
+                 << mbarrier_dtype_ << "*>(" << mbarrier_storage_name << ");\n";
   } else if (op->op.same_as(tl::get_mbarrier())) {
-    std::string barrier_name = "_mbarrier";
+    ICHECK_EQ(op->args.size(), 1);
     std::string barrier_id = this->PrintExpr(op->args[0]);
-    os << barrier_name + "[" + barrier_id + "]";
+    os << mbarrier_name_ + "[" + barrier_id + "]";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier())) {
-    print_extern_call_stmt("tl::mbarrier_arrive");
+    if (op->args.size() == 1) {
+      this->PrintIndent();
+      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+      this->stream << mbarrier_obj << ".arrive();\n";
+    } else if (op->args.size() == 3) {
+      this->PrintIndent();
+      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+      auto cta_id = this->PrintExpr(op->args[1]);
+      auto pred = this->PrintExpr(op->args[2]);
+      this->stream << mbarrier_obj << ".arrive(" << cta_id << ", " << pred
+                   << ");\n";
+    } else {
+      LOG(FATAL) << "Invalid parameter  for tl::arrive_barrier "
+                 << op->args.size();
+    }
   } else if (op->op.same_as(builtin::ptx_init_barrier_thread_count())) {
-    print_extern_call_stmt("tl::mbarrier_init");
+    ICHECK_EQ(op->args.size(), 2);
+    this->PrintIndent();
+    auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+    auto arrive_count = this->PrintExpr(op->args[1]);
+    this->stream << mbarrier_obj << ".init(" << arrive_count << ");\n";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier_expect_tx())) {
-    print_extern_call_stmt("tl::mbarrier_arrive_expect_tx");
+    if (op->args.size() == 2) {
+      this->PrintIndent();
+      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+      auto transaction_bytes = this->PrintExpr(op->args[1]);
+      this->stream << mbarrier_obj << ".arrive_and_expect_tx("
+                   << transaction_bytes << ");\n";
+    } else if (op->args.size() == 4) {
+      this->PrintIndent();
+      auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+      auto transaction_bytes = this->PrintExpr(op->args[1]);
+      auto cta_id = this->PrintExpr(op->args[2]);
+      auto pred = this->PrintExpr(op->args[3]);
+      this->stream << mbarrier_obj << ".arrive_and_expect_tx("
+                   << transaction_bytes << ", " << cta_id << ", " << pred
+                   << ");\n";
+    } else {
+      LOG(FATAL) << "Invalid parameter  for tl::arrive_barrier_expect_tx "
+                 << op->args.size();
+    }
   } else if (op->op.same_as(builtin::ptx_cp_async_barrier())) {
     print_extern_call_stmt("tl::mbarrier_cp_async_arrive");
   } else if (op->op.same_as(tl::mbarrier_expect_tx())) {
-    print_extern_call_stmt("tl::mbarrier_expect_tx");
+    ICHECK_EQ(op->args.size(), 2);
+    this->PrintIndent();
+    auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+    auto transaction_bytes = this->PrintExpr(op->args[1]);
+    this->stream << mbarrier_obj << ".expect_transaction(" << transaction_bytes
+                 << ");\n";
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
-    print_extern_call_stmt("tl::mbarrier_wait");
-  } else if (op->op.same_as(tl::sync_thread_partial())) {
-    print_extern_call_stmt("cutlass::arch::NamedBarrier::sync");
+    ICHECK_EQ(op->args.size(), 2);
+    this->PrintIndent();
+    auto mbarrier_obj = print_mbarrier_obj(op->args[0]);
+    auto phase = this->PrintExpr(op->args[1]);
+    this->stream << mbarrier_obj << ".wait(" << phase << ");\n";
   } else if (op->op.same_as(tl::no_set_max_nreg())) {
     return;
   } else if (op->op.same_as(tl::tma_load())) {
@@ -1000,14 +1058,15 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     auto eviction_policy =
         this->eviction_policy_names_
             [op->args[op->args.size() - 1].as<IntImmNode>()->value];
-    ss << "tl::tma_load<tl::CacheHintSm90::" << eviction_policy << ">(";
+    // Simplify the code by using the default eviction policy
+    if (eviction_policy != "EVICT_NORMAL") {
+      ss << "tl::tma_load<tl::CacheHintSm90::" << eviction_policy << ">(";
+    } else {
+      ss << "tl::tma_load(";
+    }
     auto desc = op->args[0];
     ss << this->PrintExpr(desc) << ", ";
-    if (const IntImmNode *imm = op->args[1].as<IntImmNode>()) {
-      ss << "_mbarrier[" << imm->value << "], ";
-    } else {
-      ss << this->PrintExpr(op->args[1]) << ", ";
-    }
+    ss << print_mbarrier_obj(op->args[1]) << ", ";
     for (size_t i = 2; i < op->args.size() - 1; i++) {
       if (i > 2)
         ss << ", ";
@@ -1018,26 +1077,34 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << ss.str();
   } else if (op->op.same_as(tl::tma_load_im2col())) {
     std::stringstream ss;
-    ss << "tl::tma_load_im2col<tl::CacheHintSm90::"
-       << this->eviction_policy_names_
-              [op->args[op->args.size() - 1].as<IntImmNode>()->value]
-       << ">";
+    auto eviction_policy =
+        this->eviction_policy_names_
+            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+    if (eviction_policy != "EVICT_NORMAL") {
+      ss << "tl::tma_load_im2col<tl::CacheHintSm90::" << eviction_policy << ">";
+    } else {
+      ss << "tl::tma_load_im2col";
+    }
     print_extern_call_stmt(ss.str(), 0, 1);
   } else if (op->op.same_as(tl::tma_store())) {
     std::stringstream ss;
-    ss << "tl::tma_store<tl::CacheHintSm90::"
-       << this->eviction_policy_names_
-              [op->args[op->args.size() - 1].as<IntImmNode>()->value]
-       << ">";
+    auto eviction_policy =
+        this->eviction_policy_names_
+            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+    if (eviction_policy != "EVICT_NORMAL") {
+      ss << "tl::tma_store<tl::CacheHintSm90::" << eviction_policy << ">";
+    } else {
+      ss << "tl::tma_store";
+    }
     print_extern_call_stmt(ss.str(), 0, 1);
-  } else if (op->op.same_as(tl::ptx_ldmatirx())) {
+  } else if (op->op.same_as(tl::ptx_ldmatrix())) {
     int trans = Downcast<IntImm>(op->args[0])->value;
     int num = Downcast<IntImm>(op->args[1])->value;
     std::string func_name = "tl::ptx_ldmatrix_x" + std::to_string(num);
     if (trans == 1)
       func_name += "_trans";
     print_extern_call_stmt(func_name, 2);
-  } else if (op->op.same_as(tl::ptx_stmatirx())) {
+  } else if (op->op.same_as(tl::ptx_stmatrix())) {
     int trans = Downcast<IntImm>(op->args[0])->value;
     int num = Downcast<IntImm>(op->args[1])->value;
     std::string func_name = "tl::ptx_stmatrix_x" + std::to_string(num);
@@ -1357,13 +1424,6 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     int n = Downcast<IntImm>(op->args[0])->value;
     this->stream << "__asm__ __volatile__(\"cp.async.wait_group " << n
                  << ";\");\n\n";
-  } else if (op->op.same_as(builtin::ptx_cp_async_barrier())) {
-    need_cast_smem_ptr_to_int_ = true;
-    int barrier_id = Downcast<IntImm>(op->args[0])->value;
-    CHECK(barrier_id < barrier_count_);
-    std::string barrier =
-        barrier_name_ + "[" + std::to_string(barrier_id) + "]";
-    this->stream << PrintCpAsyncBarrierAsm(barrier);
   } else if (op->op.same_as(builtin::ptx_init_barrier_thread_count())) {
     need_cast_smem_ptr_to_int_ = true;
     int barrier_id = Downcast<IntImm>(op->args[0])->value;
@@ -1394,22 +1454,6 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string barrier =
         barrier_name_ + "[" + std::to_string(barrier_id) + "]";
     this->stream << PrintWaitBarrierAsm(barrier);
-  } else if (op->op.same_as(builtin::create_barriers())) {
-    CHECK_EQ(barrier_count_, -1);
-    int barrier_count = Downcast<IntImm>(op->args[0])->value;
-    // pad barrier alignment to avoid runtime alignment errors
-    CHECK_EQ(barrier_alignment_bytes_ % sizeof(uint64_t), 0);
-    int barrier_alignment_count = barrier_alignment_bytes_ / sizeof(uint64_t);
-    if (barrier_count % barrier_alignment_count != 0) {
-      barrier_count = ((barrier_count / barrier_alignment_count) + 1) *
-                      barrier_alignment_count;
-    }
-    barrier_count_ = barrier_count;
-    this->stream << "__shared__ __align__(" << barrier_alignment_bytes_
-                 << ") uint64_t " << barrier_name_ << "[" << barrier_count
-                 << "];\n";
-    this->stream << "for (int i = 0; i < " << barrier_count << "; ++i) { "
-                 << barrier_name_ << "[i] = 0; }\n";
   } else if (op->op.same_as(builtin::ptx_ldg32())) {
     /*
     asm volatile (
@@ -1641,6 +1685,12 @@ void CodeGenTileLangCUDA::VisitStmt_(const AllocateNode *op) {
     }
     if (scope == "shared") {
       stream << ' ' << vid << '[' << constant_size << "];\n";
+    } else if (scope == "shared.barrier") {
+      auto v_id_mem = vid + "_mem";
+      stream << ' ' << v_id_mem << "[" << constant_size << "];\n";
+      PrintIndent();
+      stream << "auto " << vid << " = reinterpret_cast<" << mbarrier_dtype_
+             << "*>(" << v_id_mem << ");\n";
     } else if (scope == "local") {
       stream << ' ' << vid << '[' << constant_size << "];\n";
     } else if (scope == "local.var") {
@@ -1687,6 +1737,76 @@ void CodeGenTileLangCUDA::VisitExpr_(const RampNode *op, std::ostream &os) {
       os << ", ";
   }
   os << "))";
+}
+
+void CodeGenTileLangCUDA::VisitExpr_(const BufferLoadNode *op,
+                                     std::ostream &os) { // NOLINT(*)
+  ICHECK_EQ(op->indices.size(), 1)
+      << "Load from non-flat memory not supported.";
+  ICHECK(!op->predicate.defined())
+      << "Predicated buffer load is not supported.";
+
+  DataType value_dtype = op->dtype;
+  PrimExpr index = op->indices[0];
+  Var buffer_var = op->buffer->data;
+  DataType element_dtype = op->buffer->dtype;
+
+  int lanes = op->dtype.lanes();
+  // delcare type.
+  if (value_dtype.lanes() == element_dtype.lanes()) {
+    std::string ref = GetBufferRef(op->dtype, op->buffer.get(), index);
+    HandleVolatileLoads(ref, op, os);
+  } else {
+    bool can_vector_load = false;
+    arith::PVar<PrimExpr> base;
+    if (arith::ramp(base, 1, op->dtype.lanes()).Match(index)) {
+      const RampNode *ramp = index.as<RampNode>();
+      ICHECK(ramp);
+      can_vector_load = true;
+      // arith::ModularSet me = arith::Analyzer().modular_set(ramp->base);
+      // The condition: {k * coeff + base} divisible by the alignment for any k
+      // if (me->coeff % op->dtype.lanes() == 0 && me->base % op->dtype.lanes()
+      // == 0) {
+      //   can_vector_load = true;
+      // }
+    }
+
+    if (value_dtype.is_float4_e2m1fn() && lanes != 1) {
+      // A float4_e2m1fn element has 4 bits, which is an incomplete byte.
+      // So we cannot vector load it.
+      can_vector_load = false;
+    }
+    if (can_vector_load) {
+      std::string ref = GetVecLoad(op->dtype, op->buffer.get(), base.Eval());
+      HandleVolatileLoads(ref, op, os);
+    } else {
+      std::ostringstream svalue_expr;
+      std::string sindex = SSAGetID(PrintExpr(index), index.dtype());
+      std::string vid = GetVarID(buffer_var.get());
+      DataType elem_type = op->dtype.element_of();
+      for (int i = 0; i < lanes; ++i) {
+        std::ostringstream value_temp;
+        if (!HandleTypeMatch(buffer_var.get(), elem_type)) {
+          value_temp << "((";
+          if (buffer_var.get()->dtype.is_handle()) {
+            auto it = alloc_storage_scope_.find(buffer_var.get());
+            if (it != alloc_storage_scope_.end()) {
+              PrintStorageScope(it->second, value_temp);
+            }
+          }
+          PrintType(elem_type, value_temp);
+          value_temp << "*)" << vid << ')';
+        } else {
+          value_temp << vid;
+        }
+        value_temp << '[';
+        PrintVecElemLoad(sindex, index.dtype(), i, value_temp);
+        value_temp << ']';
+        PrintVecElemLoadExpr(op->dtype, i, value_temp.str(), svalue_expr);
+      }
+      os << svalue_expr.str();
+    }
+  }
 }
 
 void CodeGenTileLangCUDA::VisitExpr_(const BroadcastNode *op,
