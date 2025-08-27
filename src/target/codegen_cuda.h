@@ -50,6 +50,7 @@ public:
   void VisitStmt_(const EvaluateNode *op) final;
   void VisitStmt_(const AllocateNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
+  void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
 
   // Override this as a work around for __grid_constant__ parameter
   void AddFunction(const GlobalVar &gvar, const PrimFunc &f);
@@ -113,6 +114,10 @@ private:
   const std::string barrier_name_ = "barrier";
   // The size of the barrier array in shared memory
   int barrier_count_ = -1;
+  // The name of the mbarrier array in shared memory
+  const std::string mbarrier_name_ = "mbarrier";
+  // The type name of the mbarrier array
+  const std::string mbarrier_dtype_ = "Barrier";
   // The alignment of the barrier array in shared memory
   // Set to 16 to maintain minimum alignment requirements for async bulk copy
   const int barrier_alignment_bytes_ = 16;
