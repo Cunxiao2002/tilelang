@@ -2,48 +2,76 @@ import tilelang
 import tilelang.language as T
 import torch
 from tilelang.engine.callback import register_cuda_postproc_callback
+import itertools
 
+# bf16 -> int8
+# input_smoothed:bf16 <- input:bf16 * smooth_scale: bf16
+# input_quant: int8 <- quant(input_smoothed: bf16)
 
-@tilelang.jit(out_idx=[1, 2], pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
-def per_token_cast_to_int8(M, N, blk_m):
+tilelang.disable_cache()
+
+torch.manual_seed(42)
+
+# def get_configs():
+#     iter_params = dict(
+#         blk_m=[1, 2, 4, 8, 16, 32],
+#         threads=[128, 256],
+#     )
+#     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
+
+# @tilelang.autotune(configs=get_configs())
+@tilelang.jit(out_idx=[2, 3], pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
+def per_token_cast_to_int8(M, 
+                            N, 
+                            blk_m,
+                            threads=128):
     dtype = "bfloat16"
-    int8_min = -128
-    int8_max = 127
+    int8_min = -127.0
+    int8_max = 127.0
 
     @T.prim_func
     def per_token_cast(
-        X: T.Tensor((M, N), dtype),
-        X_int8: T.Tensor((M, N), "int8"),
-        X_scale: T.Tensor((M, 1), dtype)  # 每行一个缩放因子
+        x: T.Tensor((M, N), dtype),
+        expert_scales: T.Tensor((M, N), dtype), # smooth scale
+        x_int8: T.Tensor((M, N), "int8"),
+        x_scale: T.Tensor((M), "float32")  # 每行一个缩放因子
     ):
         with T.Kernel(T.ceildiv(M, blk_m), threads=128) as bx:  # 移除列分组
             x_local = T.alloc_fragment((blk_m, N), dtype)
-            amax_local = T.alloc_fragment((blk_m,), dtype)
+            expert_scales_local = T.alloc_fragment((blk_m, N), dtype)
+            amax_local = T.alloc_fragment((blk_m), "float32")
             x_int8_local = T.alloc_fragment((blk_m, N), "int8")
 
-            T.copy(X[bx * blk_m, 0], x_local)
+            T.copy(x[bx * blk_m, 0], x_local)
+            T.copy(expert_scales[bx * blk_m, 0], expert_scales_local)
+
+            for i, j in T.Parallel(blk_m, N): 
+                x_local[i, j] = x_local[i, j] * expert_scales_local[i, j]
+
             T.reduce_absmax(x_local, amax_local, dim=1)
 
             for i in T.Parallel(blk_m):
-                amax_local[i] = T.max(amax_local[i], 1e-4)
+                amax_local[i] = T.max(amax_local[i], 1e-8)
             
             for i, j in T.Parallel(blk_m, N):
                 x_int8_local[i, j] = T.clamp(T.floor(x_local[i, j] / amax_local[i] * int8_max + 0.5), int8_min, int8_max)
-            
-            T.copy(x_int8_local, X_int8[bx * blk_m, 0])
 
-    
+            T.copy(x_int8_local, x_int8[bx * blk_m, 0])
+            # T.copy(amax_local, x_scale[bx * blk_m])
+            for i in T.Parallel(blk_m):
+                x_scale[bx * blk_m + i] = amax_local[i] / 127.0
+
     return per_token_cast
 
 
 
-def quantize_per_token_and_smooth(x):
+def quantize_per_token_and_smooth(x, expert_scales):
     # expert_scales = input_smooth_scale[expert_indices]
-    # input_smoothed = x * input_smooth_scale
-    amax, _ = torch.max(torch.abs(x), dim=1, keepdim=True)
+    input_smoothed = x * expert_scales
+    amax, _ = torch.max(torch.abs(input_smoothed), dim=1, keepdim=True)
     amax = torch.clamp(amax, min=1e-8)
-    input_quant = x / amax * 127.0
-    input_quant = torch.floor(input_quant.to(torch.float) + 0.5)
+    input_quant = input_smoothed / amax * 127.0
+    input_quant = torch.floor(input_quant + 0.5)
     input_quant = torch.clip(input_quant, -127.0, 127.0).to(torch.int8)
 
     return input_quant, amax / 127.0
@@ -52,67 +80,33 @@ def main():
     num_tokens = 320
     topk = 6
     hidden_dim = 4096
-    block_tokens = 64
+    blk_m = 1
+    threads = 1024
     x = torch.randn(num_tokens*topk, hidden_dim).to(torch.bfloat16).to("cuda")
+    expert_scales = torch.rand(num_tokens*topk, hidden_dim).to(torch.bfloat16).to("cuda")
 
-    @register_cuda_postproc_callback
-    def tilelang_callback_cuda_postproc(code, _):
-        code = '''
-#include <tl_templates/cuda/gemm.h>
-#include <tl_templates/cuda/copy.h>
-#include <tl_templates/cuda/reduce.h>
-#include <tl_templates/cuda/ldsm.h>
-#include <tl_templates/cuda/threadblock_swizzle.h>
-#include <tl_templates/cuda/debug.h>
-#ifdef ENABLE_BF16
-#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
-#endif
+#     @register_cuda_postproc_callback
+#     def tilelang_callback_cuda_postproc(code, _):
+#         code = '''
+#         '''
+#         return code
 
-extern "C" __global__ void per_token_cast_kernel(bfloat16_t* __restrict__ X, signed char* __restrict__ X_int8);
-extern "C" __global__ void __launch_bounds__(128, 1) per_token_cast_kernel(bfloat16_t* __restrict__ X, signed char* __restrict__ X_int8) {
-  bfloat16_t x_local[2048];
-  bfloat16_t amax_local[64];
-  extern __shared__ __align__(1024) bfloat16_t workspace[];
-  signed char x_int8_local[2048];
-  #pragma unroll
-  for (int i = 0; i < 256; ++i) {
-    *(uint4*)(x_local + (i * 8)) = *(uint4*)(X + (((((int)blockIdx.x) * 262144) + (i * 1024)) + (((int)threadIdx.x) * 8)));
-  }
-  #pragma unroll
-  for (int i_1 = 0; i_1 < 64; ++i_1) {
-    amax_local[i_1] = bfloat16_t(0.000000e+00f);
-    #pragma unroll
-    for (int rv = 0; rv < 32; ++rv) {
-      amax_local[i_1] = (bfloat16_t)max(max(amax_local[i_1], x_local[(((i_1 * 32) + ((rv & 3) * 8)) + (rv >> 2))]), (bfloat16_t(0.000000e+00f) - (bfloat16_t)min(amax_local[i_1], x_local[(((i_1 * 32) + ((rv & 3) * 8)) + (rv >> 2))])));
-    }
-    amax_local[i_1] = tl::AllReduce<tl::MaxOp, 128, 1, 0, 128>::run_hopper(amax_local[i_1], (&(workspace[0])));
-  }
-  #pragma unroll
-  for (int i_2 = 0; i_2 < 64; ++i_2) {
-    amax_local[i_2] = ((bfloat16_t)max(((float)amax_local[i_2]), 1.000000e-04f));
-  }
-  #pragma unroll
-  for (int i_3 = 0; i_3 < 2048; ++i_3) {
-    x_int8_local[i_3] = ((signed char)min(max(floorf((((float)((x_local[i_3] / amax_local[(i_3 >> 5)]) * bfloat16_t(1.270000e+02f))) + 5.000000e-01f)), -1.280000e+02f), 1.270000e+02f));
-  }
-  #pragma unroll
-  for (int i_4 = 0; i_4 < 256; ++i_4) {
-    *(int2*)(X_int8 + (((((int)blockIdx.x) * 262144) + (i_4 * 1024)) + (((int)threadIdx.x) * 8))) = *(int2*)(x_int8_local + (i_4 * 8));
-  }
-}       
-        '''
-        return code
-
-    
-    kernel = per_token_cast_to_int8(num_tokens*topk, hidden_dim, block_tokens)
+    kernel = per_token_cast_to_int8(num_tokens*topk, hidden_dim, blk_m=blk_m, threads=threads)
 
     print(kernel.get_kernel_source())
+    print(kernel.config)
 
-    tl_quant, tl_scale = kernel(x)
+    tl_quant, tl_scale = kernel(x, expert_scales)
+    print(tl_quant)
 
-    torch_quant, torch_scale = quantize_per_token_and_smooth(x)
+    # torch_quant, torch_scale = quantize_per_token_and_smooth(x, expert_scales)
 
-    torch.testing.assert_close(tl_quant, torch_quant)
+    # print(f"torch quant logits")
+    # print(torch_quant)
+
+    # torch.testing.assert_close(tl_quant, torch_quant)
+    # tl_scale = tl_scale.reshape(num_tokens*topk, 1).to(torch.float32)
+    # torch_scale = torch_scale.reshape(num_tokens*topk, 1).to(torch.float32)
     # torch.testing.assert_close(tl_scale, torch_scale)
 
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)

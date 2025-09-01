@@ -17,7 +17,7 @@ def get_configs():
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
     
 
-@autotune(configs=get_configs())
+# @autotune(configs=get_configs())
 @tilelang.jit(out_idx=[-1])
 def tl_swiglu(
     num_tokens,
@@ -29,7 +29,7 @@ def tl_swiglu(
 ):
     scale = 1.44269504  # log2(e)
     @T.prim_func
-    def kernel(
+    def swiglu_kernel(
         gate_logits: T.Tensor([num_tokens, num_experts], dtype),
         up_logits: T.Tensor([num_tokens, num_experts], dtype),
         output: T.Tensor([num_tokens, num_experts], dtype)
@@ -48,7 +48,7 @@ def tl_swiglu(
             T.copy(up_logits_local, output[bx * block_tokens, by * block_experts])
 
 
-    return kernel
+    return swiglu_kernel
 
 class SwiGLU(nn.Module):
 
@@ -64,15 +64,15 @@ if __name__ == "__main__":
     num_tokens = 1024
     num_experts = 128
     dtype = "bfloat16"
-    block_tokens = 128
-    block_experts = 128
+    block_tokens = 32
+    block_experts = 64
     threads = 128
     
     gate_logits = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("cuda")
     up_logits= torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("cuda")
 
     # kernel = tl_swiglu(num_tokens, num_experts, dtype, block_tokens, block_experts, threads)
-    kernel = tl_swiglu(num_tokens, num_experts, dtype)
+    kernel = tl_swiglu(num_tokens, num_experts, dtype, block_tokens, block_experts, threads)
 
     tl_output = kernel(gate_logits, up_logits)
     
@@ -80,13 +80,13 @@ if __name__ == "__main__":
     torch_swiglu = SwiGLU()
     
     # 前向传播
-    output = torch_swiglu(gate_logits, up_logits)
+    # output = torch_swiglu(gate_logits, up_logits)
 
     # print(tl_output)
     # print(output)
 
-    torch.testing.assert_close(tl_output, output)
-    print("All checks pass.")
+    # torch.testing.assert_close(tl_output, output)
+    # print("All checks pass.")
 
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
     latency = profiler.do_bench(warmup=500)

@@ -19,7 +19,7 @@ def get_configs():
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
 
 # @tilelang.autotune(configs=get_configs())
-@tilelang.jit(out_idx=[-2, -1])
+@tilelang.jit(out_idx=[-3, -2, -1])
 def scatter(
     num_tokens,
     hidden_dim,
@@ -39,17 +39,51 @@ def scatter(
         idxs: T.Tensor((total_tokens), "int32"),
         tokens_idxs: T.Tensor((total_tokens), "int32"),
         stacked_expert_tokens: T.Tensor((total_tokens, hidden_dim), input_dtype),
+        stacked_expert_tokens_idx: T.Tensor((total_tokens), "int32"),
         stacked_expert_weights: T.Tensor((total_tokens), weight_dtype),
     ):
         with T.Kernel(T.ceildiv(total_tokens, blk_tokens), threads=threads) as bx:
-            # 直接求scatter后的结果
-            tx = T.get_thread_binding(0)
-            source_weight_idx = idxs[bx * blk_tokens + tx]
-            stacked_expert_weights[bx * blk_tokens + tx] = flat_expert_gates[source_weight_idx]
 
+            # 首先copy expert_tokens_idx，保证输出结果的正确
+            tx = T.get_thread_binding(0)
+            stacked_expert_tokens_idx[bx * blk_tokens + tx] = tokens_idxs[bx * blk_tokens + tx]
+
+
+
+            # 然后copy expert_weights
+            input_shared = T.alloc_shared((blk_tokens, blk_hidden), input_dtype)
+            source_token_idx_frag = T.alloc_fragment((blk_tokens), "int32")
+            source_weight_idx_frag = T.alloc_fragment((blk_tokens), "int32")
+            stacked_expert_weights_frag = T.alloc_fragment((blk_tokens), weight_dtype)
+
+            T.copy(tokens_idxs[bx * blk_tokens], source_token_idx_frag)
+            T.copy(idxs[bx * blk_tokens], source_weight_idx_frag)
+
+
+            for i in T.Parallel(blk_tokens):
+                stacked_expert_weights_frag[i] = flat_expert_gates[source_weight_idx_frag[i]]
+            
+            T.copy(stacked_expert_weights_frag, stacked_expert_weights[bx * blk_tokens])
+
+            # copy expert_tokens
             for k in T.serial(T.ceildiv(hidden_dim, blk_hidden)):
                 for i, j in T.Parallel(blk_tokens, blk_hidden):
-                    stacked_expert_tokens[bx * blk_tokens + i, k * blk_hidden +j] = input_flat[tokens_idxs[bx * blk_tokens + i], k * blk_hidden +j]
+                    input_shared[i, j] = input_flat[source_token_idx_frag[i], k * blk_hidden + j]
+
+                    T.copy(input_shared, stacked_expert_tokens[bx * blk_tokens, k * blk_hidden])
+
+
+            # 直接求scatter后的结果
+            # tx = T.get_thread_binding(0)
+            # source_token_idx = tokens_idxs[bx * blk_tokens + tx]
+            # source_weight_idx = idxs[bx * blk_tokens + tx]
+
+            # stacked_expert_weights[bx * blk_tokens + tx] = flat_expert_gates[source_weight_idx]
+            # stacked_expert_tokens_idx[bx * blk_tokens + tx] = source_token_idx
+
+            # for k in T.serial(T.ceildiv(hidden_dim, blk_hidden)):
+            #     for i, j in T.Parallel(blk_tokens, blk_hidden):
+            #         stacked_expert_tokens[bx * blk_tokens + i, k * blk_hidden +j] = input_flat[tokens_idxs[bx * blk_tokens + i], k * blk_hidden +j]
 
     return scatter_kernel
 
@@ -88,7 +122,6 @@ def ref_program(x_flat, flat_expert_weights, flat_expert_indices, idxs, num_toke
 
 
 def main():
-    # best config
     num_tokens = 320
     hidden_dim = 4096
     num_experts = 128
@@ -109,19 +142,19 @@ def main():
         x_flat, flat_expert_weights, flat_expert_indices, idxs.squeeze(-1), num_tokens, topk, hidden_dim)
 
     # 调用tilelang kernel
-    blk_tokens = 64
-    blk_hidden = 4096 # 进一步增加blk_hidden
-    threads = 64
+    blk_tokens = 256
+    blk_hidden = 128 # 进一步增加blk_hidden
+    threads = 128
 
     # 将torch dtype转换为tilelang dtype字符串
     dtype_str = "float32" if x.dtype == torch.float32 else ("bfloat16" if x.dtype == torch.bfloat16 else str(x.dtype).split('.')[-1])
     weight_dtype = "float32"
     kernel = scatter(num_tokens, hidden_dim, topk, dtype_str, weight_dtype, blk_tokens, blk_hidden, threads)
-    # kernel = scatter(num_tokens, hidden_dim, num_experts, topk, dtype_str)
+    # kernel = scatter(num_tokens, hidden_dim, num_experts, topk, dtype_str, weight_dtype)
 
     # 准备tilelang kernel的输入
     tl_input_flat = x_flat
-    tl_flat_expert_gates = flat_expert_weights
+    tl_flat_expert_gates = flat_expert_weights  # 使用flatten后的形状 (total_tokens, 1)
     tl_flat_expert_indices = flat_expert_indices.to(torch.int32)  # 转换为int32
     tokens_idxs = idxs // topk
 
@@ -132,10 +165,8 @@ def main():
     tl_stacked_expert_weights = torch.zeros((total_tokens, 1), dtype=flat_expert_weights.dtype, device=x_flat.device)
 
     # 调用kernel - 让tilelang自己创建输出张量
-    tl_stacked_expert_tokens, tl_stacked_expert_weights = kernel(
+    tl_stacked_expert_tokens, tl_stacked_expert_tokens_idx, tl_stacked_expert_weights = kernel(
         tl_input_flat, tl_flat_expert_gates, idxs.to(torch.int32), tokens_idxs.to(torch.int32))
-    
-    tl_stacked_expert_tokens_idx = tokens_idxs.to(torch.int32)
 
     print(kernel.config)
     print(kernel.get_kernel_source())

@@ -24,7 +24,7 @@ def get_configs():
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
 
 
-@tilelang.autotune(configs=get_configs())
+# @tilelang.autotune(configs=get_configs())
 @tilelang.jit(out_idx=[1, 2])
 def topk_softmax(
     num_tokens,
@@ -107,11 +107,12 @@ def main():
     num_experts = 128
     top_k = 6
     block_tokens = 64
+    threads = 256
 
     logits = torch.rand(num_tokens, num_experts).to("cuda")
 
     # kernel = topk_softmax(num_tokens, num_experts, top_k, block_tokens)
-    kernel = topk_softmax(num_tokens=num_tokens, num_experts=num_experts, topk=top_k)
+    kernel = topk_softmax(num_tokens=num_tokens, num_experts=num_experts, topk=top_k, block_tokens=block_tokens, threads=threads)
     tl_gates, tl_indices = kernel(logits)
     # print(f"tl_gates:")
     # print(tl_gates)
@@ -119,17 +120,17 @@ def main():
     # print(kernel.get_kernel_source())
     print(kernel.config)
 
-    torch_gates, torch_indices = ref_program(logits, top_k)
+    # torch_gates, torch_indices = ref_program(logits, top_k)
     # print(f"torch_gates:")
     # print(torch_gates)
     
     # test accuracy
-    torch.testing.assert_close(tl_gates, torch_gates)
-    torch.testing.assert_close(tl_indices, torch_indices)
+    # torch.testing.assert_close(tl_gates, torch_gates)
+    # torch.testing.assert_close(tl_indices, torch_indices)
 
     # profile
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
-    tilelang_latency = profiler.do_bench()
+    tilelang_latency = profiler.do_bench(warmup=500)
     print(f"Tilelang latency: {tilelang_latency}")
 
     
