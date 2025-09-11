@@ -172,14 +172,15 @@ def matmul_int8xint4(M, N, K, in_dtype, out_dtype, accum_dtype, block_M, block_N
 def assert_matmul_int8xint4_correctness(M, N, K, in_dtype, out_dtype, accum_dtype, block_M, block_N, block_K, num_stages, num_bits, threads):
     kernel = matmul_int8xint4(M, N, K, in_dtype, out_dtype, accum_dtype, block_M, block_N, block_K, num_stages, threads, num_bits)
     # kernel = matmul_int8xint4(M, N, K, in_dtype, out_dtype, accum_dtype)
-
+    print(kernel.get_kernel_source())
     profiler = kernel.get_profiler()
     input_tensors = profiler._get_inputs()
     tl_output = kernel(*input_tensors)
+    ref_output = ref_program(*input_tensors)
+
     print(tl_output)
-    # ref_output = ref_program(*input_tensors)
-    # print(ref_output)
-    # torch.testing.assert_close(tl_output, ref_output, rtol=0.01, atol=0.01)
+    print(ref_output)
+    torch.testing.assert_close(tl_output, ref_output, rtol=0.01, atol=0.01)
     
     print("all check pass")
 
@@ -196,5 +197,5 @@ def assert_matmul_int8xint4_correctness(M, N, K, in_dtype, out_dtype, accum_dtyp
 
 
 
-# assert_matmul_int8xint4_correctness(256, 256, 256, "int8", "int32", "int32", 128, 128, 128, 2, 4, 128)
-assert_matmul_int8xint4_correctness(8192, 8192, 8192, "int8", "int32", "int32", 128, 128, 256, 3, 4, 512)
+assert_matmul_int8xint4_correctness(256, 256, 256, "int8", "int32", "int32", 128, 128, 128, 2, 4, 128)
+# assert_matmul_int8xint4_correctness(8192, 8192, 8192, "int8", "int32", "int32", 128, 128, 256, 3, 4, 512)
