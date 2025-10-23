@@ -284,9 +284,12 @@ def test_sparse_gqa_fwd(B=1,
 
     tl_out, tl_lse = sparse_gqa_fwd_interface(
         q, k, v, indices, block_I=block_I, num_stages=num_stages, threads=threads)
-
+    
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    _  = ref_sparse_gqa_fwd_interface(q, k, v, indices)
     if check_correctness:
-        # otherwise may cause out of memory
+        # otherwise may cause out of me3mory
         ref_out = ref_sparse_gqa_fwd_interface(q, k, v, indices)
         # print(f"tl_out \n{tl_out}")
         # print(f"ref_out \n{ref_out}")
@@ -308,6 +311,160 @@ def test_sparse_gqa_fwd(B=1,
     print("fwd io bandwidth = ", (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
     print("fwd tflops = ", (B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12)
 
+    # ref_ms = do_bench(ref_sparse_gqa_fwd_interface(q, k, v, indices), rep=100, warmup=250)
+    # print(f"Average torch time: {ref_ms:.3f} ms")
+
+
+def bench_sparse_gqa_fwd():
+    """
+    Benchmark sparse GQA forward pass with different configurations.
+    Tests various combinations of batch size, sequence length, heads, dimensions, and topk values.
+    """
+    import pandas as pd
+    
+    # Configuration lists
+    batch_sizes = [1]
+    seq_lens = [1024, 4096, 16384, 32768]
+    head_configs = [(32, 4)]  # (H, HKV)
+    dim_configs = [(64, 64)]  # (DQK, DV)
+    topk_values = [512, 2048]
+    block_I_values = [64, 128]
+    num_stages_values = [2, 3]
+    threads_values = [128, 256]
+    
+    results = []
+    
+    print("=" * 100)
+    print("Benchmarking Sparse GQA Forward Pass")
+    print("=" * 100)
+    
+    config_count = 0
+    total_configs = len(batch_sizes) * len(seq_lens) * len(head_configs) * len(dim_configs) * len(topk_values)
+    
+    for B in batch_sizes:
+        for S in seq_lens:
+            SKV = S  # Keep SKV same as S for simplicity
+            for H, HKV in head_configs:
+                for DQK, DV in dim_configs:
+                    for topk in topk_values:
+                        # Skip if topk > S (invalid configuration)
+                        
+                        # Test with default block_I, num_stages, threads
+                        block_I = 64
+                        num_stages = 2
+                        threads = 256
+                        
+                        config_count += 1
+                        print(f"\n[{config_count}] Testing config:")
+                        print(f"  B={B}, S={S}, SKV={SKV}, H={H}, HKV={HKV}, DQK={DQK}, DV={DV}, topk={topk}")
+                        print(f"  block_I={block_I}, num_stages={num_stages}, threads={threads}")
+                        
+                        try:
+                            # Create input tensors
+                            torch.random.manual_seed(0)
+                            q = torch.randn((B, S, H, DQK), dtype=torch.bfloat16, device="cuda")
+                            k = torch.randn((B, SKV, HKV, DQK), dtype=torch.bfloat16, device="cuda")
+                            v = torch.randn((B, SKV, HKV, DV), dtype=torch.bfloat16, device="cuda")
+                            
+                            # Create sparse indices
+                            indices = torch.full((B, S, HKV, topk), SKV, dtype=torch.int32, device="cuda")
+                            for b in range(B):
+                                for t in range(S):
+                                    for h in range(HKV):
+                                        i_i = torch.randperm(max(1, t))[:topk]
+                                        indices[b, t, h, :len(i_i)] = i_i
+                            
+                            # Benchmark function
+                            def fn():
+                                return sparse_gqa_fwd_interface(
+                                    q, k, v, indices, 
+                                    block_I=block_I, 
+                                    num_stages=num_stages, 
+                                    threads=threads
+                                )
+                            
+                            from tilelang.profiler import do_bench
+                            
+                            # Run benchmark
+                            ms = do_bench(fn, rep=100, warmup=50)
+                            
+                            # Calculate metrics
+                            # IO bandwidth: reading Q, K, V and writing O
+                            io_bytes = B * S * H * DQK * 2  # Q (bf16)
+                            io_bytes += B * S * HKV * topk * DQK * 2  # K (bf16, sparse)
+                            io_bytes += B * S * HKV * topk * DV * 2  # V (bf16, sparse)
+                            io_bytes += B * S * H * DV * 2  # O (bf16)
+                            io_bandwidth_tbps = io_bytes / (ms * 1e-3) / 1e12
+                            
+                            # Compute TFLOPs: QK^T and SV matmuls
+                            flops = 2 * B * S * H * DQK * topk  # QK^T
+                            flops += 2 * B * S * H * DV * topk  # SV
+                            tflops = flops / (ms * 1e-3) / 1e12
+                            
+                            print(f"  ✓ Latency: {ms:.3f} ms")
+                            print(f"  ✓ IO Bandwidth: {io_bandwidth_tbps:.3f} TB/s")
+                            print(f"  ✓ Compute: {tflops:.3f} TFLOPs")
+                            
+                            results.append({
+                                'Batch': B,
+                                'SeqLen': S,
+                                'Heads': H,
+                                'HeadsKV': HKV,
+                                'DimQK': DQK,
+                                'DimV': DV,
+                                'TopK': topk,
+                                'BlockI': block_I,
+                                'Stages': num_stages,
+                                'Threads': threads,
+                                'Latency(ms)': round(ms, 3),
+                                'Bandwidth(TB/s)': round(io_bandwidth_tbps, 3),
+                                'TFLOPs': round(tflops, 3)
+                            })
+                            
+                        except Exception as e:
+                            print(f"  ✗ Failed: {str(e)}")
+                            results.append({
+                                'Batch': B,
+                                'SeqLen': S,
+                                'Heads': H,
+                                'HeadsKV': HKV,
+                                'DimQK': DQK,
+                                'DimV': DV,
+                                'TopK': topk,
+                                'BlockI': block_I,
+                                'Stages': num_stages,
+                                'Threads': threads,
+                                'Latency(ms)': 'FAILED',
+                                'Bandwidth(TB/s)': 'FAILED',
+                                'TFLOPs': 'FAILED'
+                            })
+    
+    # Print summary table
+    print("\n" + "=" * 100)
+    print("BENCHMARK RESULTS SUMMARY")
+    print("=" * 100)
+    
+    df = pd.DataFrame(results)
+    print(df.to_string(index=False))
+    
+    # Save results to CSV
+    df.to_csv('sparse_gqa_benchmark_results.csv', index=False)
+    print(f"\nResults saved to 'sparse_gqa_benchmark_results.csv'")
+    
+    # Print best configurations
+    valid_results = df[df['Latency(ms)'] != 'FAILED']
+    if not valid_results.empty:
+        print("\n" + "=" * 100)
+        print("TOP 5 FASTEST CONFIGURATIONS")
+        print("=" * 100)
+        top5 = valid_results.nsmallest(5, 'Latency(ms)')
+        print(top5.to_string(index=False))
+        
+        print("\n" + "=" * 100)
+        print("TOP 5 HIGHEST THROUGHPUT (TFLOPs)")
+        print("=" * 100)
+        top5_tflops = valid_results.nsmallest(5, 'TFLOPs')
+        print(top5_tflops.to_string(index=False))
 
 if __name__ == "__main__":
     test_sparse_gqa_fwd(
@@ -324,3 +481,4 @@ if __name__ == "__main__":
         block_I=64,
         num_stages=2,
         threads=256)
+    # bench_sparse_gqa_fwd()
