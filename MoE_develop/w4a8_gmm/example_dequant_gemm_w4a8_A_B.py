@@ -131,17 +131,18 @@ def matmul_int8xint4(M, N, K, in_dtype, out_dtype, accum_dtype, block_M, block_N
     def main(
             A: T.Tensor(A_shape, in_dtype),
             B: T.Tensor(B_shape, storage_dtype),
-            Ct: T.Tensor((N, M), out_dtype),
+            Ct: T.Tensor((M, N), out_dtype),
     ):
-        with T.Kernel(
-                T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+        # with T.Kernel(
+        #         T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+        with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads) as (bx, by):
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
             B_shared = T.alloc_shared(B_shared_shape, storage_dtype)
             B_local = T.alloc_fragment(B_shared_shape, storage_dtype)
             B_dequantize_local = T.alloc_fragment(B_dequantize_local_shape, in_dtype)
             B_dequantize_prev_local = T.alloc_fragment(B_dequantize_local_shape, in_dtype)
-            Ct_local = T.alloc_fragment((block_N, block_M), accum_dtype)
-            Ct_shared = T.alloc_shared((block_N, block_M), out_dtype)
+            Ct_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            Ct_shared = T.alloc_shared((block_M, block_N), out_dtype)
 
             T.annotate_layout({
                 B_shared: tilelang.layout.make_swizzled_layout(B_shared),
@@ -150,8 +151,8 @@ def matmul_int8xint4(M, N, K, in_dtype, out_dtype, accum_dtype, block_M, block_N
 
             T.clear(Ct_local)
             for k in T.Pipelined(K // block_K, num_stages=num_stages):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[bx * block_N, k * block_K // num_elems_per_byte], B_shared)
+                T.copy(A[bx * block_M, k * block_K], A_shared)
+                T.copy(B[by * block_N, k * block_K // num_elems_per_byte], B_shared)
                 T.copy(B_shared, B_local)
                 for i, j in T.Parallel(block_N, block_K):
                     B_dequantize_local[i, j] = _tir_u8_to_i4_to_i8(
@@ -161,10 +162,10 @@ def matmul_int8xint4(M, N, K, in_dtype, out_dtype, accum_dtype, block_M, block_N
                         dtype=in_dtype,
                     )
                 T.copy(B_dequantize_local, B_dequantize_prev_local)
-                T.gemm(B_dequantize_prev_local, A_shared, Ct_local, transpose_B=True)
+                T.gemm(A_shared, B_dequantize_prev_local, Ct_local, transpose_B=True)
             T.copy(Ct_local, Ct_shared)
-            T.copy(Ct_shared, Ct[bx * block_N:(bx + 1) * block_N,
-                                    by * block_M:(by + 1) * block_M])
+            T.copy(Ct_shared, Ct[bx * block_M:(bx + 1) * block_M,
+                                    by * block_N:(by + 1) * block_N])
 
     return main
 # test_int4_int8_convert_close()

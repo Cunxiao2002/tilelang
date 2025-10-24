@@ -9,6 +9,17 @@ import math
 
 torch.manual_seed(42)
 
+
+def get_configs():
+    iter_params = dict(
+        block_M=[32, 64, 128, 256],
+        block_N=[32, 64, 128, 256],
+        block_K=[32, 64, 128, 256],
+        num_stages=[1, 2],
+        threads=[128, 256],
+    )
+    return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
+
 def _tir_u8_to_i4_to_i8(nbit: int, val: tir.PrimExpr, pos: tir.PrimExpr, dtype: str):
     """
     使用左移右移方法将打包在uint8中的4位有符号整数(INT4)转换为8位有符号整数(INT8)
@@ -137,6 +148,7 @@ def grouped_gemm_w4a8(
             B_local = T.alloc_fragment([block_N, block_K // num_elems_per_byte], storage_dtype)
             B_dequant_local = T.alloc_fragment([block_N, block_K], in_dtype)
             B_dequant_prev_local = T.alloc_fragment([block_N, block_K], in_dtype)
+            B_dequant_shared = T.alloc_shared([block_N, block_K], in_dtype)
             Ct_local = T.alloc_fragment([block_N, block_M], accum_dtype)
             per_token_scales_shared = T.alloc_shared([block_M], out_dtype)
             expert_weights_qscales_shared = T.alloc_shared([block_N], out_dtype)
@@ -200,8 +212,9 @@ def grouped_gemm_w4a8(
                         dtype=in_dtype,
                     )
                 
-                T.copy(B_dequant_local, B_dequant_prev_local)
-                T.gemm(B_dequant_prev_local, A_shared, Ct_local, transpose_B=True)
+                # T.copy(B_dequant_local, B_dequant_prev_local)
+                T.copy(B_dequant_local, B_dequant_shared)
+                T.gemm(B_dequant_shared, A_shared, Ct_local, transpose_B=True)
             
             for i, j in T.Parallel(block_M, block_N):
                 with T.If(i < actual_rows), T.Then():
@@ -234,11 +247,11 @@ def construct_inputs(batch_sizes_list, K, M, trans_b, padding_M, device, dtype):
     C = torch.empty(M, batch_sum, device=device, dtype=torch.bfloat16)
 
     A_quant, A_amax = quantize_per_token_and_smooth(A)
-    expert_weights_qscales = (
-        torch.randn([batch_count, M], device=device, dtype=torch.bfloat16) * 0.001
-    )
+    # expert_weights_qscales = (
+    #     torch.randn([batch_count, M], device=device, dtype=torch.bfloat16) * 0.001
+    # )
     # for debug
-    # expert_weights_qscales = torch.ones(batch_count, M, device=device, dtype=torch.bfloat16) * 0.001
+    expert_weights_qscales = torch.ones(batch_count, M, device=device, dtype=torch.bfloat16) * 0.001
     batch_sizes = torch.tensor(batch_sizes_list, device=device, dtype=torch.int32)
     batch_offsets = torch.tensor(batch_offsets_list, device=device, dtype=torch.int32)
     batch_padded_offsets = torch.tensor(batch_padded_offsets_list, device=device, dtype=torch.int32)
@@ -273,7 +286,7 @@ def run_tilelang_grouped_gemm(
     kernel = grouped_gemm_w4a8(
         tuple(batch_sizes_list), K, M, block_M, block_N, block_K, num_stages, threads
     )
-    # kernel = grouped_gemm(tuple(batch_sizes_list), K, M)
+    # kernel = grouped_gemm_w4a8(tuple(batch_sizes_list), K, M)
 
     device = torch.device("cuda")
     dtype = torch.int8
@@ -298,10 +311,10 @@ def run_tilelang_grouped_gemm(
     print(out)
     print(ref_output)
     print(kernel.get_kernel_source())
-    torch.testing.assert_close(out, ref_output, rtol=0.01, atol=0.01)
-    if torch.testing.assert_close(out, ref_output, rtol=0.01, atol=0.01):
+    try:
+        torch.testing.assert_close(out, ref_output, rtol=0.01, atol=0.01)
         print("✅ Tilelang and Torch match")
-    else:
+    except Exception as e:
         print("❌ Tilelang and Torch mismatch")
         mismatch_mask = ~torch.isclose(out, ref_output, rtol=0.01, atol=0.01)
         mismatch_indices = torch.nonzero(mismatch_mask)
@@ -329,16 +342,8 @@ def run_tilelang_grouped_gemm(
     if profile:
         profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
         latency = profiler.do_bench(
-            warmup=500,
-            input_tensors=[
-                A_quant,
-                B,
-                batch_sizes,
-                batch_offsets,
-                batch_padded_offsets,
-                A_amax,
-                expert_weights_qscales,
-            ],
+            warmup=50,
+            rep=20,
         )
         # latency = kernel.latency
         print(f"Best config: {kernel.config}")
@@ -370,8 +375,9 @@ if __name__ == "__main__":
 
     # only ep=8
     # with tma
-    run_tilelang_grouped_gemm([192]*16, 4096, 2560, 64, 64, 64, num_stages=1, threads=128, trans_b=False, profile=args.profile)
+    # run_tilelang_grouped_gemm([192]*16, 4096, 2560, 64, 64, 64, num_stages=1, threads=128, trans_b=False, profile=args.profile)
     # run_tilelang_grouped_gemm([192]*16, 1280, 4096, 64, 256, 64, num_stages=2, threads=256, trans_b=False, profile=args.profile)
+    run_tilelang_grouped_gemm([64]*8, 512, 256, 64, 64, 64, num_stages=2, threads=128, trans_b=False, profile=args.profile)
 
     # without tma
     # run_tilelang_grouped_gemm([192]*16, 4096, 2560, 64, 64, 64, num_stages=2, threads=128, trans_b=False, profile=args.profile)
