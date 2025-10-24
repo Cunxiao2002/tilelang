@@ -8,9 +8,10 @@ from tilelang.layout import make_swizzled_layout
 from tvm import tir
 import itertools
 from tilelang.engine.callback import register_cuda_postproc_callback
+from tvm import DataType
 
 torch.manual_seed(42)
-# tilelang.disable_cache()
+tilelang.disable_cache()
 
 '''
 Qserve量化方案
@@ -31,7 +32,7 @@ def get_configs():
 
 def _tir_u8_to_i4_to_i8(nbit: int, val: tir.PrimExpr, pos: tir.PrimExpr, dtype: str):
     """
-    使用左移右移方法将打包在uint8中的4位有符号整数(INT4)转换为8位有符号整数(INT8)
+    使用左移右移方法将打包在uint8中的4位有符号整数(INT4)转换为8位有符号整数(INT8) b
     """
     assert nbit == 4
     assert dtype == "int8"
@@ -50,53 +51,6 @@ def _tir_u8_to_i4_to_i8(nbit: int, val: tir.PrimExpr, pos: tir.PrimExpr, dtype: 
     i8 = i8_shifted >> tir.const(4, "int8")  # 注意这里使用int8类型的右移（算术右移）
     
     return i8
-
-# 前一个放高位，后一个放低位
-def quantize_per_group(w, group_size=32, bits=4):
-    ''' 
-    w(int8) -> per-group quant -> int4 -> 2xint4 pack int8
-    '''
-    if w.dim() == 3:
-        G, N, K = w.shape
-        N = G * N
-    elif w.dim() == 2:
-        N, K = w.shape
-    
-    num_groups_per_row = K // group_size
-    w_grouped = w.view(N, num_groups_per_row, group_size)
-
-    min_vals = torch.min(w_grouped, dim=2).values
-    max_vals = torch.max(w_grouped, dim=2).values
-    q_max = 2**bits - 1
-    q_min = 0
-
-    scales = (max_vals - min_vals) / (q_max - q_min)
-    scales = torch.clamp(scales, min=1e-8)
-
-    # zero_point = qmin - min_vals / scale
-    zero_points = q_min - min_vals / scales
-    zero_points = torch.round(zero_points).clamp(q_min, q_max)
-    
-    scales_expanded = scales.unsqueeze(2)
-    zero_points_expanded = zero_points.unsqueeze(2)
-
-    # q = round(x / scale + zero_point)
-    quantized_w = torch.round(w_grouped / scales_expanded + zero_points_expanded)
-
-    u4 = quantized_w.clamp(q_min, q_max).to(torch.uint8)
-    quantized_2d = u4.view(N, K)
-    
-    high = quantized_2d[:, 0::2]
-    low = quantized_2d[:, 1::2]
-
-    packed_w_u8 = ((high << 4) | (low & 0x0F)).to(torch.int8)
-
-    if w.dim() == 3:
-        packed_w_u8 = packed_w_u8.view(G, N // G, K // 2)
-        scales = scales.view(G, N // G, -1).to(torch.uint8)
-        zero_points = zero_points.view(G, N // G, -1)
-
-    return packed_w_u8, scales, zero_points.to(torch.uint8)
 
 def quantize_per_token_and_smooth(x):
     amax, _ = torch.max(torch.abs(x), dim=1, keepdim=True)
@@ -120,13 +74,66 @@ def grouped_gemm_w4a8(
     """
     assert in_dtype == "int8"
     storage_dtype = "uint8"
+    accum_dtype = "int32"
     num_elems_per_byte = 8 // num_bits
     batch_sum = sum(batch_sizes_list)
     batch_count = len(batch_sizes_list)
-    accum_dtype = "int32"
+
     total_m_blocks = sum((size + block_M - 1) // block_M for size in batch_sizes_list)
 
     assert K % (block_K) == 0
+    block_QK = block_K // num_elems_per_byte
+
+    # fast dequant for uint4 to int8
+    def get_fast_dequant_uint4_int8_func(in_dtype="uint4", out_dtype="int8"):
+        assert in_dtype == "uint4"
+        assert out_dtype == "int8"
+
+        # Some variables for dequantization in each thread
+        MAX_TRANSACTION_SIZE_BITS = 128
+        local_size = MAX_TRANSACTION_SIZE_BITS // DataType(out_dtype).bits # 128 // 8 = 16
+        local_compress_size = local_size // num_elems_per_byte # 16 // 2 = 8
+
+        @T.macro
+        def fast_dequant_uint4_int8(B_shared, B_dequant_shared, scale_shared, k):
+            tx = T.get_thread_binding()
+
+            B_local_thread = T.alloc_local((local_compress_size,), storage_dtype)
+            B_dequant_local_thread = T.alloc_local((local_size,), out_dtype)
+            scale_local_thread = T.alloc_local((1,), storage_dtype)
+            
+            for i in T.serial(0, block_N * block_K // threads // local_size):
+                index_base = i * threads * local_compress_size + tx * local_compress_size
+                for v in T.vectorized(0, local_compress_size):
+                    index = index_base + v
+                    B_local_thread[v] = B_shared[index // block_QK, index % block_QK]
+                scale_index = index_base // (group_size // num_elems_per_byte)
+                si = scale_index // (block_K // group_size)
+                sj = scale_index % (block_K // group_size)
+                scale_local_thread[0] = scale_shared[si, k * block_K // group_size + sj]
+
+                #TODO(cx) unpack函数
+                # 首先将原本的unpack函数放过来。
+                # 后续采用liquid gemm的方案时要将这里替换掉
+                for i in T.Parallel(local_size):
+                    B_dequant_local_thread[i] = _tir_u8_to_i4_to_i8(
+                                                num_bits,
+                                                B_local_thread[i // num_elems_per_byte],
+                                                i % num_elems_per_byte,
+                                                dtype="int8",
+                                                )
+
+                # last, store the dequantized data to shared memory
+                # for v in T.Parallel(local_size):
+                #     B_dequant_local_thread[v] *= scale_local_thread[0]
+                
+                for v in T.vectorized(0, local_size):
+                    index = i * threads * local_size + tx * local_size + v
+                    B_dequant_shared[index // block_K, index % block_K] = B_dequant_local_thread[v]
+            
+        return fast_dequant_uint4_int8
+
+
     @T.prim_func
     def qserve_kernel(
         A: T.Tensor((batch_sum, K), in_dtype),  # type: ignore
@@ -146,6 +153,7 @@ def grouped_gemm_w4a8(
         ) as (by, bx):
             A_shared = T.alloc_shared([block_M, block_K], in_dtype)
             B_shared = T.alloc_shared([block_N, block_K // num_elems_per_byte], storage_dtype)
+            B_dequant_shared = T.alloc_shared([block_N, block_K], in_dtype)
             B_local = T.alloc_fragment([block_N, block_K // num_elems_per_byte], storage_dtype)
             B_unpack_local = T.alloc_fragment([block_N, block_K], in_dtype)
             B_dequant_local = T.alloc_fragment([block_N, block_K], in_dtype)
@@ -212,28 +220,14 @@ def grouped_gemm_w4a8(
                     B_shared,
                 )
                 T.copy(B_shared, B_local)
-                # 两种形式生成的代码是等价的
-                # for i, j in T.Parallel(block_N, block_K // num_elems_per_byte):
-                #     B_local[i, j] = B_shared[i, j]
 
-                for i, j in T.Parallel(block_N, block_K):
-                    B_unpack_local[i, j] = _tir_u8_to_i4_to_i8(
-                        num_bits,   
-                        B_local[i, j // num_elems_per_byte],
-                        j % num_elems_per_byte,
-                        dtype=in_dtype,
-                    )
-                
-                for i, j in T.Parallel(block_N, block_K):
-                    zp = per_group_zero_points_local[i, j // group_size]
-                    B_dequant_local[i, j] = (B_unpack_local[i, j] - zp) * per_group_scales_local[i, j // group_size]
-                    # B_dequant_local[i, j] = B_dequant_local[i, j]
-
-                T.gemm(B_dequant_local, A_shared, Ct_local, transpose_B=True)
+                get_fast_dequant_uint4_int8_func()(B_shared, B_dequant_shared, per_group_scales_local, k)
+                # T.gemm(B_dequant_local, A_shared, Ct_local, transpose_B=True)
+                T.gemm(B_dequant_shared, A_shared, Ct_local, transpose_B=True)
 
                 
             for i, j in T.Parallel(block_M, block_N):
-                Ct_dequant_local[j, i] = Ct_local[j, i] * per_token_scales_shared[i] * expert_weights_qscales_shared[j]            
+                Ct_dequant_local[j, i] = Ct_local[j, i] * per_token_scales_shared[i] * expert_weights_qscales_shared[j]
             
             for i, j in T.Parallel(block_N, block_M):
                 with T.If(i < actual_rows), T.Then():
@@ -264,9 +258,6 @@ def construct_inputs(batch_sizes_list, K, M, trans_b, padding_M, device, dtype):
     expert_weights_qscales = (
         torch.randn([batch_count, M], device=device, dtype=torch.bfloat16) * 0.001
     )
-
-    # 将int8的B量化到int4
-    # B_quant, per_group_scales, per_group_zero_points = quantize_per_group(B, group_size=32, bits=4)
 
     # 随机生成per-group的scale
     group_size = 32
@@ -399,8 +390,6 @@ def run_tilelang_grouped_gemm(
     # kernel = grouped_gemm_w4a8(tuple(batch_sizes_list), K, M)
     # print(kernel.config)
 
-    print(kernel.get_kernel_source())
-
     device = torch.device("cuda")
     dtype = torch.int8
 
@@ -421,14 +410,13 @@ def run_tilelang_grouped_gemm(
     out = kernel(
         A_quant, B, batch_sizes, batch_offsets, batch_padded_offsets, A_amax, expert_weights_qscales, per_group_scales, per_group_zero_points
     )
-    print(out)
-    # print(kernel.get_kernel_source())
     # ref_output = torch_gmm_w4a8(
     #     A_quant, B, batch_sizes, batch_offsets, A_amax, expert_weights_qscales, per_group_scales, per_group_zero_points, trans_b=True
     # )
-    # print(out)
+    print(out)
+    print(kernel.get_kernel_source())
     # print(ref_output)
-    # print(kernel.get_kernel_source())
+    
     # try:
     #     torch.testing.assert_close(out, ref_output, rtol=0.01, atol=0.01)
     #     print("✅ Tilelang and Torch match")
@@ -447,15 +435,15 @@ def run_tilelang_grouped_gemm(
     #         tilelang_val = out[row, col].item()
     #         torch_val = ref_output[row, col].item()
     #         diff = tilelang_val - torch_val
-    #         print(f"{row}\t{col}\t{tilelang_val:.2f}\t\t{torch_val:.2f}\t{diff:.2f}")
+    #         print(f"{row}\t{col}\t{tilelang_val:.4f}\t\t{torch_val:.4f}\t{diff:.4f}")
 
     #     # 统计信息
     #     all_diffs = (out - ref_output)[mismatch_mask]
     #     print("\nStatistics:")
     #     print(f"Total mismatches: {len(mismatch_indices)}")
-    #     print(f"Max diff: {all_diffs.max().item():.2f}")
-    #     print(f"Min diff: {all_diffs.min().item():.2f}")
-    #     print(f"Avg diff: {all_diffs.float().mean().item():.2f}")
+    #     print(f"Max diff: {all_diffs.max().item():.10f}")
+    #     print(f"Min diff: {all_diffs.min().item():.10f}")
+    #     print(f"Avg diff: {all_diffs.float().mean().item():.10f}")
 
     if profile:
         profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
@@ -495,11 +483,11 @@ if __name__ == "__main__":
     # # w4a8 without tma
     # run_tilelang_grouped_gemm([36]*16, 4096, 2560, 64, 128, 32, num_stages=1, threads=128, trans_b=False, profile=args.profile) #num_tokens=768
 
-    # w4a8 with tma
+    # benchmark w4a8 with tma
     run_tilelang_grouped_gemm([36]*16, 4096, 2560, 64, 64, 128, num_stages=4, threads=128, trans_b=False, profile=args.profile) #num_tokens=768
 
     # test accuracy
     # run_tilelang_grouped_gemm([64], 128, 128, 64, 64, 64, num_stages=2, threads=128, trans_b=False, profile=args.profile)
     # run_tilelang_grouped_gemm([64]*8, 512, 256, 64, 64, 64, num_stages=2, threads=128, trans_b=False, profile=args.profile)
-    # run_tilelang_grouped_gemm([100, 200, 300, 400, 100, 230, 242, 120], 512, 256, 64, 64, 64, num_stages=2, threads=128, trans_b=True, profile=args.profile)
+    # run_tilelang_grouped_gemm([100, 200, 300, 400, 100, 230, 242, 120], 512, 256, 64, 64, 64, num_stages=2, threads=128, trans_b=False, profile=args.profile)
     # run_tilelang_grouped_gemm([100, 50], 512, 256, 64, 64, 64, num_stages=2, threads=128, trans_b=True, profile=args.profile)

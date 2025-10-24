@@ -149,8 +149,8 @@ def grouped_gemm_w4a8(
             B_local = T.alloc_fragment([block_N, block_K // num_elems_per_byte], storage_dtype)
             B_unpack_local = T.alloc_fragment([block_N, block_K], in_dtype)
             B_dequant_local = T.alloc_fragment([block_N, block_K], in_dtype)
-            Ct_dequant_local = T.alloc_shared([block_N, block_M], out_dtype)
-            Ct_local = T.alloc_fragment([block_N, block_M], accum_dtype)
+            C_dequant_local = T.alloc_shared([block_M, block_N], out_dtype)
+            C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             per_token_scales_shared = T.alloc_shared([block_M], out_dtype)
             expert_weights_qscales_shared = T.alloc_shared([block_N], out_dtype)
             per_group_scales_local = T.alloc_fragment([block_N, block_K // group_size], dtype="int8")
@@ -184,7 +184,7 @@ def grouped_gemm_w4a8(
                 ),
             )
 
-            T.clear(Ct_local)
+            T.clear(C_local)
 
             for i in T.Parallel(block_M):
                 with T.If(m_start + i < batch_sum), T.Then():
@@ -229,15 +229,16 @@ def grouped_gemm_w4a8(
                     B_dequant_local[i, j] = (B_unpack_local[i, j] - zp) * per_group_scales_local[i, j // group_size]
                     # B_dequant_local[i, j] = B_dequant_local[i, j]
 
-                T.gemm(B_dequant_local, A_shared, Ct_local, transpose_B=True)
+                # T.gemm(B_dequant_local, A_shared, Ct_local, transpose_B=True)
+                T.gemm(A_shared, B_dequant_local, C_local, transpose_B=True)
 
                 
             for i, j in T.Parallel(block_M, block_N):
-                Ct_dequant_local[j, i] = Ct_local[j, i] * per_token_scales_shared[i] * expert_weights_qscales_shared[j]            
+                C_dequant_local[i, j] = C_local[i, j] * per_token_scales_shared[i] * expert_weights_qscales_shared[j]            
             
             for i, j in T.Parallel(block_N, block_M):
                 with T.If(i < actual_rows), T.Then():
-                    C[bx * block_N + j, m_start + i] = Ct_dequant_local[j, i]
+                    C[bx * block_N + j, m_start + i] = C_dequant_local[i, j]
 
     return qserve_kernel
 
@@ -496,7 +497,7 @@ if __name__ == "__main__":
     # run_tilelang_grouped_gemm([36]*16, 4096, 2560, 64, 128, 32, num_stages=1, threads=128, trans_b=False, profile=args.profile) #num_tokens=768
 
     # w4a8 with tma
-    run_tilelang_grouped_gemm([36]*16, 4096, 2560, 64, 64, 128, num_stages=4, threads=128, trans_b=False, profile=args.profile) #num_tokens=768
+    run_tilelang_grouped_gemm([36]*16, 4096, 2560, 64, 128, 128, num_stages=4, threads=256, trans_b=False, profile=args.profile) #num_tokens=768
 
     # test accuracy
     # run_tilelang_grouped_gemm([64], 128, 128, 64, 64, 64, num_stages=2, threads=128, trans_b=False, profile=args.profile)
