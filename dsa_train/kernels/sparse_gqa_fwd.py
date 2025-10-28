@@ -2,7 +2,7 @@
 import torch
 import tilelang
 from tilelang import language as T
-from utils import assert_tensors_similar
+from .utils import assert_tensors_similar
 
 
 @tilelang.jit(
@@ -15,7 +15,6 @@ from utils import assert_tensors_similar
 def sparse_gqa_fwd(
     heads,
     dim,
-    tail_dim,
     topk,
     kv_group=4, #每组kv对应多少个q
     sm_scale=None,
@@ -27,13 +26,11 @@ def sparse_gqa_fwd(
 ):
     assert dim == tilelang.math.next_power_of_2(
         dim), f"haven't check padding correctness yet, dim={dim}"
-    # assert tail_dim == tilelang.math.next_power_of_2(
-    #     tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
     assert is_causal == True, "non-casual is not supported"
     assert (topk %
             block_I == 0), "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
-        sm_scale = (1.0 / (dim + tail_dim))**0.5 * 1.44269504  # log2(e)
+        sm_scale = (1.0 / (dim))**0.5 * 1.44269504  # log2(e)
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
@@ -188,16 +185,14 @@ def sparse_gqa_fwd_interface(q,
     is_casual = True
     assert return_p_sum == False, "This kernel file is for fwd only"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous and indices.is_contiguous()
-    batch, seq_len, heads, dim_plus_tail_dim = q.shape
+    batch, seq_len, heads, dim_q = q.shape
     _, seq_len_kv, kv_group, _ = k.shape
 
-    # assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
-    assert dim_plus_tail_dim == 64
+    assert dim_q == 64
     dim = d_v
 
     assert k.shape == v.shape
-    assert k.shape[-1] == dim_plus_tail_dim
-    tail_dim = dim_plus_tail_dim - dim
+    assert k.shape[-1] == dim_q
     assert k.shape[0] == batch
     _, _, _, topk = indices.shape
     assert indices.shape == (batch, seq_len, kv_group, topk)
@@ -205,7 +200,6 @@ def sparse_gqa_fwd_interface(q,
     kernel = sparse_gqa_fwd(
         heads,
         dim,
-        tail_dim,
         topk,
         kv_group,
         sm_scale,

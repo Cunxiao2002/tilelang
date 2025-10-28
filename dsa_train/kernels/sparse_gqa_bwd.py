@@ -2,9 +2,9 @@
 import tilelang
 from tilelang import language as T
 import torch
-from utils import assert_tensors_similar
+from .utils import assert_tensors_similar
 
-
+# torch.manual_seed(42)
 @tilelang.jit(out_idx=[-1])
 def preprocess(
     B,
@@ -47,12 +47,12 @@ def preprocess(
     return preprocess_kernel
 
 
-@tilelang.jit(out_idx=[-1, -2])
+@tilelang.jit(out_idx=[-2, -1])
 def postprocess(
     B,
     S_kv,
     D,
-    kv_group=4,
+    kv_group=2,
     block_N=64,
     threads=128,
     dtype="bfloat16",
@@ -83,7 +83,7 @@ def postprocess(
 
 
 @tilelang.jit(
-    out_idx=[-3],
+    out_idx=[-3, -2, -1],
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -127,7 +127,7 @@ def bwd(
     assert dtype == "bfloat16"
     assert accum_dtype == "float"
 
-    H = H_kv
+    H = H_kv #8
     padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
     BS = block_size
     NS = tilelang.cdiv(topk, block_size)
@@ -153,6 +153,7 @@ def bwd(
             V_shared = T.alloc_shared([BS, D], dtype)
             dO_shared = T.alloc_shared([padded_H, D], dtype)
             mask = T.alloc_fragment([BS], "bool")
+            mask_head = T.alloc_fragment([padded_H], "bool")
 
             P_shared_cast = T.alloc_shared([padded_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([padded_H, BS], dtype)
@@ -167,7 +168,7 @@ def bwd(
             acc_dv_shared = T.view(V_shared, shape=[BS // split_store, D], dtype=accum_dtype)
 
             max_kv_i = s_i
-
+        
             T.copy(Q[by, s_i, bz * padded_H:(bz + 1) * padded_H, :D], Q_shared)
             T.copy(dO[by, s_i, bz * padded_H:(bz + 1) * padded_H, :D], dO_shared)
 
@@ -228,7 +229,8 @@ def bwd(
                     dO_shared,
                     acc_dv,
                     transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol)
+                    policy=T.GemmWarpPolicy.FullCol,
+                    clear_accum=True)
 
                 for s in range(split_store):
                     for bi_i, d_i in T.Parallel(BS, D):
@@ -244,8 +246,6 @@ def bwd(
                         T.atomic_addx4(
                             dV[by, Indices[by, s_i, bz, i_i * BS + bi_i + s * (BS // split_store)],
                                 bz, d_i * 4], acc_dv_shared[bi_i, d_i * 4])
-                    
-
 
             # Store the accumulated dQ
             T.copy(acc_dq, dQ_shared)
@@ -254,7 +254,7 @@ def bwd(
     return sparse_gqa_bwd_kernel
 
 
-def sparse_gqa_bwd(q,
+def sparse_gqa_bwd_interface(q,
                    k,
                    v,
                    o,
@@ -290,7 +290,7 @@ def sparse_gqa_bwd(q,
         delta = preprocess_kernel(o, do)
     dk = torch.zeros_like(k, dtype=torch.float32)
     dv = torch.zeros_like(v, dtype=torch.float32)
-    dq = bwd_kernel(q, k, v, do, indices, lse, delta, dk, dv)
+    dq, dk, dv = bwd_kernel(q, k, v, do, indices, lse, delta)
     dk, dv = postprocess_kernel(dk, dv)
 
     return dq, dk, dv
@@ -311,9 +311,9 @@ def ref_sparse_gqa_bwd_interface(q, k, v, o, do, indices, lse, sm_scale=None, is
 
 def test_sparse_gqa_bwd(B=1,
                         S=4096,
-                        SKV=8192,
+                        SKV=4096,
                         H=32,
-                        HKV=4,
+                        HKV=2,
                         DQK=64,
                         DV=64,
                         topk=2048,
@@ -336,12 +336,10 @@ def test_sparse_gqa_bwd(B=1,
     from sparse_gqa_fwd import sparse_gqa_fwd_interface
     tl_out, tl_lse = sparse_gqa_fwd_interface(q, k, v, indices)
 
-    tl_dq, tl_dk, tl_dv = sparse_gqa_bwd(q, k, v, tl_out, do, indices, tl_lse)
+    tl_dq, tl_dk, tl_dv = sparse_gqa_bwd_interface(q, k, v, tl_out, do, indices, tl_lse)
     ref_dq, ref_dk, ref_dv = ref_sparse_gqa_bwd_interface(q, k, v, None, do, indices, None)
 
     if check_correctness:
-        print(f"tl_dq \n{tl_dq}")
-        print(f"ref_dq \n{ref_dq}")
         assert_tensors_similar(tl_dq, ref_dq, eps=1e-4, name="dq")
         assert_tensors_similar(tl_dk, ref_dk, eps=1e-4, name="dk")
         assert_tensors_similar(tl_dv, ref_dv, eps=1e-4, name="dv")
@@ -357,7 +355,7 @@ def test_sparse_gqa_bwd(B=1,
     from tilelang.profiler import do_bench
 
     def fn():
-        return sparse_gqa_bwd(q, k, v, tl_out, do, indices, tl_lse)
+        return sparse_gqa_bwd_interface(q, k, v, tl_out, do, indices, tl_lse)
 
     ms = do_bench(fn, rep=100, warmup=250)
     print(f"Average time: {ms:.3f} ms")
@@ -369,10 +367,10 @@ def test_sparse_gqa_bwd(B=1,
 if __name__ == "__main__":
     test_sparse_gqa_bwd(
         B=1,
-        S=4096,
+        S=8192,
         SKV=8192,
         H=32,
-        HKV=4,
+        HKV=2,
         DQK=64,
         DV=64,
         topk=2048,
