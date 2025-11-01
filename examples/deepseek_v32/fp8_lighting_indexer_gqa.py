@@ -150,7 +150,7 @@ def gqa_attn_return_logits(
                                                            seq_len_kv))
 
             T.copy(IndexQ[bx * block_M:(bx + 1) * block_M, by, :], index_q_shared)
-            # T.copy(Weights[seq_len_i, h_q_idx], weights)
+            T.copy(Weights[seq_len_i, by], weights)
 
             T.fill(s, 0)
 
@@ -169,7 +169,7 @@ def gqa_attn_return_logits(
                 )
 
                 for bm_i, bn_i in T.Parallel(block_M, block_N):
-                    s[bm_i, bn_i] = T.max(s[bm_i, bn_i], 0) * index_k_scale_fragment[bn_i]
+                    s[bm_i, bn_i] = T.max(s[bm_i, bn_i], 0) * index_k_scale_fragment[bn_i] * weights[bm_i]
                     
 
                 for bm_i, bn_i in T.Parallel(block_M, block_N):
@@ -263,17 +263,11 @@ def ref_fp8_gqa_logits(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor,
     cost = mask.sum()
     return logits, cost
 
-def test_fp8_lighting_indexer(S=4096, SK=4096, H=32, HKV=4, D=64, kv_stride=1):
-# def test_fp8_lighting_indexer(S=4096, SKV=8192, H=32, HKV=1, D=64, kv_stride=1):
-    # for debug
-    torch.manual_seed(42)
+def test_fp8_lighting_indexer(S=4096, SK=4096, H=32, HKV=4, D=64, kv_stride=4):
     q = torch.randn(S, H, D, device="cuda", dtype=torch.bfloat16).to(torch.bfloat16)
     k = torch.randn(SK, HKV, D, device="cuda", dtype=torch.bfloat16).to(torch.bfloat16)
     weights = torch.randn(S, H, device="cuda", dtype=torch.float32)
     p = (torch.randn(S, SK, device="cuda", dtype=torch.float32) * 4).softmax(dim=-1)
-
-    # for debug
-    weights = torch.ones(weights.shape, device=q.device, dtype=torch.float32)
 
     ks, ke = generate_random_cu_seqlens(
         per_cp_seqlen=S, cp_size=1, cp_rank=0, kv_stride=kv_stride, average_q_len=2048)
