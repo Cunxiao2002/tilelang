@@ -50,10 +50,10 @@ def validate_tensor_match(a, b, tolerance=1e-8, tensor_name="tensor", should_rai
 
 def get_configs():
     iter_params = dict(
-        block_N=[32, 64, 128],
-        num_stages=[0, 1, 2],
+        block_N=[32, 64, 128, 256],
+        num_stages=[0, 1, 2, 3],
         threads=[128, 256],
-        block_M=[1, 2, 4],
+        block_M=[16, 32, 64, 128, 256],
     )
     return [{
         k: v for k, v in zip(iter_params, values)
@@ -84,7 +84,7 @@ class SupplyProg:
 
 supply_prog = SupplyProg()
 
-
+# @tilelang.autotune(configs=get_configs())
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -93,10 +93,10 @@ def gqa_attn_return_logits(
     heads,
     heads_kv,
     index_dim,
-    block_N=256,
+    block_N=32,
     num_stages=3,
     threads=128,
-    block_M=None,
+    block_M=128,
 ):
     assert heads % heads_kv == 0
     group_size = heads // heads_kv # 1个group中有多少个q head
@@ -108,6 +108,8 @@ def gqa_attn_return_logits(
 
     seq_len = T.symbolic("seq_len")
     seq_len_kv = T.symbolic("seq_len_kv")
+    # seq_len = 4096
+    # seq_len_kv = 4096
 
     index_q_shape = [seq_len, heads, index_dim]
     index_k_shape = [seq_len_kv, heads_kv, index_dim]
@@ -224,7 +226,7 @@ def gqa_attn_return_logits_interface(q,
 
     clean_logits_kernel = clean_logits_()
 
-    mqa_attn_return_logits_kernel = gqa_attn_return_logits(heads=heads, heads_kv=heads_kv, index_dim=index_dim, block_M=64)
+    mqa_attn_return_logits_kernel = gqa_attn_return_logits(heads=heads, heads_kv=heads_kv, index_dim=index_dim)
     logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
     mqa_attn_return_logits_kernel(
         q.view(seq_len, heads, index_dim),
