@@ -265,7 +265,7 @@ def ref_fp8_gqa_logits(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor,
     cost = mask.sum()
     return logits, cost
 
-def test_fp8_lighting_indexer(S=4096, SK=4096, H=32, HKV=4, D=64, kv_stride=4):
+def test_fp8_lighting_indexer(S=4096, SK=4096, H=32, HKV=4, D=64, kv_stride=1):
     q = torch.randn(S, H, D, device="cuda", dtype=torch.bfloat16).to(torch.bfloat16)
     k = torch.randn(SK, HKV, D, device="cuda", dtype=torch.bfloat16).to(torch.bfloat16)
     weights = torch.randn(S, H, device="cuda", dtype=torch.float32)
