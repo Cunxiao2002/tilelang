@@ -86,7 +86,7 @@ void LayoutNode::RegisterReflection() {
 
 void LayoutNode::UpdateAnalyzer(arith::Analyzer *analyzer) const {
   for (const auto &[var, dom] : getVarMap()) {
-    analyzer->Bind(var, dom);
+    analyzer->Bind(var, dom); // 将var绑定到某个范围内，后续进行分析都是基于这个范围。
   }
 }
 
@@ -129,8 +129,11 @@ Array<PrimExpr> LayoutNode::OutputShape() const {
   return ret;
 }
 
+// 将输入的(i,j)坐标映射为实际的坐标，本质上个替换的过程
+// 输入(i, j)
+// 输出(i * 4 + j / 2, j % 2)
 Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
-  if (vars.empty())
+  if (vars.empty()) // vars是输入的坐标变量数组
     return forward_index_;
   ICHECK_GE(vars.size(), InputDim());
 
@@ -140,6 +143,7 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
     transform_vars.push_back(vars[i]);
   }
 
+  // 创建vmap映射，后续通过Substitute将InputPlaceholder[i]替换为transform_vars[i]
   Map<Var, PrimExpr> vmap;
   for (size_t i = 0; i < InputDim(); i++) {
     vmap.Set(InputPlaceholder(i), transform_vars[i]);
@@ -217,15 +221,16 @@ Fragment FragmentNode::Replicate(int repeats) const {
                   ReplicateExtent() * repeats, std::nullopt);
 }
 
+// 消除多余的replicate，通过计算最大公约数
 Fragment FragmentNode::DeReplicate() const {
   ICHECK(OutputDim() == 1);
   arith::Analyzer analyzer;
   UpdateAnalyzer(&analyzer);
   int factor = 1;
-  auto rep_size = as_const_int(ReplicateExtent());
+  auto rep_size = as_const_int(ReplicateExtent()); // replicate进行复制的个数
   auto idx_size = as_const_int(OutputShape()[0]);
   if (rep_size && idx_size) {
-    factor = arith::ZeroAwareGCD(*rep_size, *idx_size);
+    factor = arith::ZeroAwareGCD(*rep_size, *idx_size); // 计算最大公约数
   }
   if (factor == 1)
     return tvm::ffi::GetRef<Fragment>(this);
@@ -245,6 +250,7 @@ Fragment FragmentNode::BindThreadRange(Range thread_range) const {
   return Fragment(n);
 }
 
+// 计算layout的反变换
 std::pair<Layout, arith::IterMapLevel> LayoutNode::InverseWithLevel() const {
   arith::Analyzer analyzer;
   auto collect_symbolic = [&](const Array<PrimExpr> &shape) {
@@ -272,7 +278,7 @@ std::pair<Layout, arith::IterMapLevel> LayoutNode::InverseWithLevel() const {
                   << symbolic_dims;
   }
   arith::IterMapResult res =
-      arith::DetectIterMap(forward_index_, getVarMap(), 1, level, &analyzer);
+      arith::DetectIterMap(forward_index_, getVarMap(), 1, level, &analyzer); //尝试把PrimExpr转换成IterSumExpr
   if (!res->errors.empty()) {
     std::ostringstream msg;
     msg << "Layout " << DebugOutput() << " has errors: " << res->errors;
@@ -284,8 +290,13 @@ std::pair<Layout, arith::IterMapLevel> LayoutNode::InverseWithLevel() const {
   for (size_t i = 0; i < OutputDim(); i++) {
     outputs.push_back(InputPlaceholder(i));
   }
-
-  auto inv = arith::InverseAffineIterMap(res->indices, outputs);
+  auto inv = arith::InverseAffineIterMap(res->indices, outputs); // 计算从输出维度到输入维度的逆映射。res->indices是正向索引变换
+  // 假设输入坐标(i, j), 输出坐标(x, y)
+  // x = 2 * i + j
+  // y = i + j
+  // 通过Inverse可以计算出来从输出坐标到输入坐标的变换 (本质上是消元？)
+  // i = x - y
+  // j = 2 * y - x
 
   Array<PrimExpr> backward_index;
   for (size_t i = 0; i < InputDim(); i++) {
@@ -477,9 +488,10 @@ Layout FragmentNode::Reshape(const Array<PrimExpr> &shape,
 
 Layout LayoutNode::Inverse() const {
   auto inverse_result = InverseWithLevel();
-  return std::move(inverse_result.first);
+  return std::move(inverse_result.first); // 使用move来移动语义，使用移动构造函数而不是拷贝构造函数，避免拷贝，减少不必要的拷贝开销和引用计数
 }
 
+// 从thread映射推断index映射
 PrimExpr infer_fragment_index(const Map<Var, Range> &input_iters,
                               const PrimExpr &forward_thread,
                               arith::Analyzer *analyzer) {
@@ -556,6 +568,10 @@ bool FragmentNode::IsCompletedReplicated() const {
                          ReplicationPlaceholder());
 }
 
+// injective：单射，即一个输入对应一个输出，且输出是不同的.
+// x1 != x2 -> f(x1) != f(x2)
+// 如果f(x1) = f(x2)，则x1 = x2
+// 判断单射是为了保证不同的thread不会处理同一块内存
 arith::IterMapResult FragmentNode::DetectInjective() const {
   // lei:To perform injective check, we need to reverse the layout
   // and use surjective check, now we use bijective check for convenience
@@ -600,6 +616,17 @@ arith::IterMapResult FragmentNode::DetectInjective() const {
   }
 
   return arith::DetectIterMap(indices, getVarMap(), 1, level, &analyzer);
+  // DetectIterMap会将IterVar变成仿射的形式
+  // 仿射变换：y = a*x + b  (a, b 为常数)
+  // 准放射变换：y = a*x + b + floor(c*x + d)  (包含向下取整运算)
+  
+  // Fuse：
+  // 输入：x₀ ∈ [0,4), x₁ ∈ [0,3), x₂ ∈ [0,2)
+  // 输出：y = x₂×12 + x₁×4 + x₀ ∈ [0,24)
+  
+  // Split
+  // 输入：x ∈ [0,24)
+  // 输出：[y₀, y₁, y₂] = [x % 3, (x % 12) ÷ 3, x ÷ 12]
 }
 
 PrimExpr FragmentNode::ThreadExtent() const {
@@ -650,6 +677,7 @@ std::pair<Layout, arith::IterMapLevel> FragmentNode::InverseWithLevel() const {
   return fwd->InverseWithLevel();
 }
 
+// 将replicate的维度提取为独立的iter var
 Fragment FragmentNode::CondenseReplicateVar() const {
   arith::Analyzer analyzer;
   auto input_iters = getVarMap();

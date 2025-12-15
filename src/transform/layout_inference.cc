@@ -40,7 +40,8 @@ using namespace tir;
 /*!
  * \brief collect the mapping from the buffer var to it allocated buffer
  */
-class ThreadBindingCollector : public StmtExprVisitor {
+
+ class ThreadBindingCollector : public StmtExprVisitor {
 public:
   void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tir::attr::thread_extent) {

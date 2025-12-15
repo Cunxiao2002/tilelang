@@ -371,7 +371,7 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
             opt_var && inner_vars_.count(*opt_var)) {
           std::ostringstream oss;
           oss << "loop_var_to_thread = " << loop_var_to_thread
-              << "contains inner var" << *opt_var;
+              << " contains inner var " << *opt_var;
           throw LayoutConflictException(oss.str());
         }
       });

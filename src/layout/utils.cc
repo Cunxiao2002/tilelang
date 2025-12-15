@@ -119,6 +119,7 @@ Array<IterSplitExpr> get_unused_iters(const IterMark &mark,
 // appears in fused forms across multiple index expressions. We first normalize
 // every index into IterSumExpr, collect all splits per source Var, then
 // consolidate them to avoid misclassifying a used split as unused.
+
 Array<IterSplitExpr> DivideUnusedIterators(const Array<PrimExpr> &exprs,
                                            const Array<IterVar> input_iters,
                                            Analyzer *analyzer) {
