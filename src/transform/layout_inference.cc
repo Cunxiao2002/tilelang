@@ -41,6 +41,7 @@ using namespace tir;
  * \brief collect the mapping from the buffer var to it allocated buffer
  */
 
+// 检测program是否已显式bind线程
  class ThreadBindingCollector : public StmtExprVisitor {
 public:
   void VisitStmt_(const AttrStmtNode *op) final {
@@ -67,6 +68,8 @@ struct LayoutInferenceResult {
 
 class BufferUseDefCollector : public IRVisitorWithAnalyzer {
 public:
+  // 通过skip_thread_partition判断判断layout inference的过程和thread有没有关系
+  // 和thread有关系的话，一般在GPU相关的设备中
   BufferUseDefCollector(bool skip_thread_partition)
       : skip_thread_partition_(skip_thread_partition) {}
 
@@ -75,6 +78,7 @@ public:
   void RunInferStep(int cur_infer_id, InferLevel level, bool update_queue,
                     LayoutMap &layout_map, const LayoutMap &strict_layout_map,
                     std::deque<int> &q, std::vector<bool> &in_queue) {
+    // infer_list_是1个包含了所有TileOp的vector
     auto num_infer = infer_list_.size();
 
     // Range check for cur_infer_id
@@ -87,7 +91,7 @@ public:
     // thread_var_vec_[cur_infer_id]
     auto &next = infer_list_[cur_infer_id];
     auto iter_var = thread_var_vec_[cur_infer_id];
-    auto thread_bounds = thread_bounds_vec_[cur_infer_id];
+    auto thread_bounds = thread_bounds_vec_[cur_infer_id]; // 线程范围
     arith::Analyzer *cur_analyzer = analyzer_vec_[cur_infer_id].get();
     auto buffer_oob = buffer_oob_vec_[cur_infer_id];
     // Double-check that 'next' is valid
@@ -110,10 +114,11 @@ public:
            "required for layout inference.";
 
     // Run InferLayout
+    // InferLayout具体的定义放在每个TileOp中，返回LayoutMap
     auto updates =
         next->InferLayout(LayoutInferArgs{target_, thread_bounds, layout_map,
                                           cur_analyzer, buffer_oob},
-                          level);
+                          level); 
 
     // Process the returned updates
     for (const auto &[buffer, layout] : updates) {
@@ -122,6 +127,7 @@ public:
       ICHECK(layout.defined()) << "InferLayout returned an undefined layout.";
 
       // Helper: propagate inferred layout to alias buffers (same data Var)
+      // 将已经推断成功的布局传播到和该Buffer共享相同内存空间（data var相同）的别名buffer上
       auto propagate_alias = [&](const Buffer &src_buffer,
                                  const Layout &src_layout) {
         if (!buffer_data_to_buffers_.count(src_buffer->data))
@@ -148,13 +154,16 @@ public:
                                         Integer(src_buffer->dtype.bytes()),
                                         Integer(sib->dtype.bytes()));
           if (layout_map.count(sib)) {
+            // 如果别名buffer已经存在layout，则检查layout是否一致
             ICHECK(target_layout->IsEqual(layout_map[sib].get()))
                 << "Get different layout for alias buffer " << sib
                 << " (data-shared with " << src_buffer
                 << ")\n current: " << target_layout->DebugOutput()
                 << "\n previous: " << layout_map[sib]->DebugOutput();
           } else {
+            // 如果别名buffer不存在layout，则在Layout_map中添加该别名buffer的layout
             layout_map.Set(sib, target_layout);
+            // 别名buffer设置新的layout后，将所有使用该buffer的tileop都加入到BFS队列中进行inference
             if (update_queue && use_list_.count(sib)) {
               for (int idx : use_list_[sib]) {
                 EnqueueWithPriority(idx, q, in_queue, cur_infer_id, layout_map);
@@ -166,6 +175,7 @@ public:
 
       if (layout_map.count(buffer)) {
         // If new layout contains the old one, update map
+        // 在layout_map中可以找到该buffer对应的layout
         if (buffer.scope() == "local.fragment" &&
             level != InferLevel::kStrict && !strict_layout_map.count(buffer)) {
           // Actually this test has been done in ParallelOp::InferLayout
@@ -185,16 +195,20 @@ public:
           const auto &src_layout = src_layout_opt.value();
           ICHECK(dst_layout->InputDim() == src_layout->InputDim());
           Array<PrimExpr> indices;
-          indices.reserve(dst_layout->InputDim());
+          indices.reserve(dst_layout->InputDim()); // reverse用于提前分配好内存空间的大小，避免频繁的内存分配和释放
           arith::Analyzer inner_analyzer;
           for (int i = 0; i < dst_layout->InputDim(); ++i) {
             auto x = InputPlaceholder(i);
             indices.push_back(x);
             // should be literal - literal = 0, any analyzer will work
+            // 检验dst_layout和src_layout的shape是否一致
+            // 并将每个indice的范围bind到inner_analyzer，用于后续分析范围
             ICHECK(is_zero(inner_analyzer.Simplify(
                 dst_layout->InputShape()[i] - src_layout->InputShape()[i])));
             inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
           }
+          // 检查new layout能否包含old layout
+          // 如果包含，说明new layout更通用，可以替换掉old layout
           if (ProveFragmentContains(src_layout, dst_layout, indices, indices,
                                     inner_analyzer)) {
             layout_map.Set(buffer, layout);
@@ -212,6 +226,7 @@ public:
         propagate_alias(buffer, layout);
       } else {
         // Otherwise, update map
+        // 在layout_map中没有找到该buffer对应的layout，则在Layout_map中添加该buffer的layout
         layout_map.Set(buffer, layout);
         // Propagate to alias buffers (may enqueue their users)
         propagate_alias(buffer, layout);
@@ -240,7 +255,7 @@ public:
       }
     }
   };
-
+  // 使用BFS进行layout inference
   void FinishInferQueue(InferLevel level, LayoutMap &layout_map,
                         const LayoutMap &strict_layout_map, std::deque<int> &q,
                         std::vector<bool> &in_queue) {
@@ -326,10 +341,11 @@ public:
     // propagate (reshape if needed) to the rest to ensure completeness.
     for (const auto &[var, buffers] : buffer_data_to_buffers_) {
       // Find a representative with existing layout
-      Optional<Buffer> rep;
+      Optional<Buffer> rep; // Optional<T>表示rep可能不存在
       Optional<Layout> rep_layout;
       for (const auto &buf : buffers) {
         if (layout_map.count(buf)) {
+          // 找到第一个由layout的buffer
           rep = buf;
           rep_layout = layout_map[buf];
           break;
@@ -338,6 +354,7 @@ public:
       if (!rep_layout.defined())
         continue;
       for (const auto &buf : buffers) {
+        // 处理没有layout的buffer
         if (!layout_map.count(buf)) {
           bool shapes_equal =
               rep_layout.value()->InputShape().size() == buf->shape.size();
@@ -364,6 +381,7 @@ public:
     }
 
     // Check that all local.fragment buffers have inferred layouts
+    // 检查是否所有fragment的layout都inference成功
     for (const auto &[buffer, _] : use_list_) {
       if (buffer.scope() == "local.fragment") {
         ICHECK_NE(layout_map.count(buffer), 0)
@@ -373,6 +391,7 @@ public:
     }
 
     // Collect layout info for For nodes
+    // 收集和T.Parallel layout相关的信息
     Map<For, Fragment> for_map;
     Map<For, PrimExpr> predicate_map;
     ICHECK(infer_list_.size() == thread_var_vec_.size())
@@ -389,6 +408,7 @@ public:
         ICHECK(for_infer->GetLoopLayout().defined())
             << "The Layout for Parallel for cannot be inferred correctly:\n"
             << for_infer->GetRoot();
+        // 将循环layout加入到for_map中
         for_map.Set(for_infer->GetRoot(), for_infer->GetLoopLayout());
         // thread_var_ should be defined if we rely on it
         ICHECK(thread_var.defined())
@@ -814,7 +834,7 @@ private:
     IRVisitorWithAnalyzer::VisitStmt_(op);
   }
 
-  Map<Var, Array<Buffer>> buffer_data_to_buffers_;
+  Map<Var, Array<Buffer>> buffer_data_to_buffers_; //每个data var对应的所有buffer，多个buffer对象可以共享同一个data var
   std::vector<ObjectRef> infer_list_stmt_;
   std::vector<TileOperator> infer_list_;
   std::unordered_map<Buffer, std::vector<int>, ObjectPtrHash, ObjectPtrEqual>
